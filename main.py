@@ -45,7 +45,7 @@ from lunardate import LunarDate
 def get_stock_data(symbol):
     try:
         to_ts = int(time.time())
-        from_ts = to_ts - (5 * 24 * 3600) # Lấy 5 ngày gần nhất
+        from_ts = to_ts - (5 * 24 * 3600)
         url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers).json()
@@ -98,36 +98,31 @@ def calculate_hexagram(dt):
     new_thuong, new_ha = (new_trig, thuong) if is_upper else (thuong, new_trig)
     return f"G{id_goc}-B{king_wen_matrix[new_thuong-1][new_ha-1]}"
 
-# --- 8. PHÂN TÍCH CẢM XÚC NÂNG CAO (SMART AI) ---
 def analyze_smart_action(text):
     if not isinstance(text, str): return "GIỮ", 0.0
     text = text.lower()
     
-    # 1. Tín hiệu MẠNH (100% Vốn/Hàng)
     strong_buy = ['đại cát', 'lợi lớn', 'bay cao', 'thời cơ vàng', 'mua ngay', 'tất tay', 'all-in']
     strong_sell = ['nguy hiểm', 'sập', 'tháo chạy', 'bán tháo', 'tuyệt vọng', 'cắt lỗ ngay']
     
-    if any(w in text for w in strong_buy): return "MUA", 1.0  # Mua 100% tiền
-    if any(w in text for w in strong_sell): return "BÁN", 1.0 # Bán 100% hàng
+    if any(w in text for w in strong_buy): return "MUA", 1.0 
+    if any(w in text for w in strong_sell): return "BÁN", 1.0
 
-    # 2. Tín hiệu TRUNG BÌNH (50% Vốn/Hàng)
-    normal_buy = ['mua', 'tốt', 'lãi', 'tích lũy', 'hanh thông', 'tăng']
-    normal_sell = ['bán', 'xấu', 'lỗ', 'giảm', 'trở ngại', 'hạ tỷ trọng']
+    normal_buy = ['mua', 'tốt', 'lãi', 'tích lũy', 'hanh thông', 'tăng', 'nên mua']
+    normal_sell = ['bán', 'xấu', 'lỗ', 'giảm', 'trở ngại', 'hạ tỷ trọng', 'nên bán']
 
-    if any(w in text for w in normal_buy): return "MUA", 0.5  # Mua 50% tiền
-    if any(w in text for w in normal_sell): return "BÁN", 0.5 # Bán 50% hàng
+    if any(w in text for w in normal_buy): return "MUA", 0.5
+    if any(w in text for w in normal_sell): return "BÁN", 0.5
 
     return "GIỮ", 0.0
 
-# --- 9. KIỂM TRA LỊCH SỬ (CHỐNG TRÙNG) ---
+# --- 8. KIỂM TRA LỊCH SỬ ---
 def get_existing_signatures(symbol):
-    # Lấy 100 bản ghi gần nhất để đối chiếu
     payload = {
         "filter": {"property": "Mã", "rich_text": {"contains": symbol}},
         "sorts": [{"property": "Giờ Giao Dịch", "direction": "descending"}],
         "page_size": 100 
     }
-    # Fallback sort nếu chưa có cột date
     try:
         data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
     except:
@@ -138,14 +133,13 @@ def get_existing_signatures(symbol):
     if data and 'results' in data:
         for p in data['results']:
             try:
-                # Dùng Time Signature từ Tiêu đề (VD: 13:00 08/12)
                 t = p['properties']['Thời Gian']['title'][0]['plain_text']
                 match = re.search(r'(\d{2}:\d{2} \d{2}/\d{2})', t)
                 if match: s.add(match.group(1))
             except: pass
     return s
 
-# --- 10. HÀM CHẠY CHIẾN DỊCH ---
+# --- 9. HÀM CHẠY CHIẾN DỊCH ---
 def run_campaign(config):
     try:
         name = config['properties']['Tên Chiến Dịch']['title'][0]['plain_text']
@@ -156,7 +150,6 @@ def run_campaign(config):
 
     print(f"\n🚀 Processing: {name} ({symbol})")
     
-    # 1. Lấy Data
     data = []
     if "Binance" in market or "Crypto" in market:
         try:
@@ -171,18 +164,12 @@ def run_campaign(config):
         print("   -> ❌ Không có dữ liệu giá.")
         return
 
-    # 2. Nạp Lời khuyên
     df_adv = load_advice_data()
     adv_map = dict(zip(df_adv['KEY_ID'], df_adv['Lời Khuyên']))
 
-    # 3. Lấy dữ liệu đã ghi để chống trùng
     existing = get_existing_signatures(symbol)
     
-    # Khôi phục trạng thái tài khoản giả định (Reset mỗi lần chạy Action để tính ROI chuẩn cho nến hiện tại)
-    # Lưu ý: Để theo dõi Portfolio thực tế lâu dài, bạn cần lưu 'cash/stock' vào Database riêng. 
-    # Ở đây ta giả lập dòng tiền chạy từ đầu chuỗi 48h để khớp với biểu đồ.
     cash, stock, equity = capital, 0, capital
-    
     new_logs_count = 0
 
     for item in data:
@@ -192,61 +179,55 @@ def run_campaign(config):
         key = calculate_hexagram(dt)
         advice = adv_map.get(key, "")
         
-        # --- LOGIC THÔNG MINH (V27) ---
         action, percent = analyze_smart_action(advice)
         
-        qty = 0
-        note = "" # Ghi chú lệnh thực hiện
-        display_label = "GIỮ" # Nhãn hiển thị trên Notion
+        qty, note = 0, ""
+        display_label = "GIỮ"
 
-        # XỬ LÝ MUA
+        # --- LOGIC KHỚP LỆNH (ĐÃ SỬA LỖI NGƯỠNG VỐN) ---
         if action == "MUA":
-            # Tính tiền muốn mua (50% hoặc 100% tiền đang có)
             amount_to_spend = cash * percent
-            if amount_to_spend > 10000: # Mua tối thiểu 10k VND hoặc 1$
-                # Tính số lượng
+            # FIX LỖI: Giảm ngưỡng tối thiểu xuống 1 (để hỗ trợ cả USD và VNĐ)
+            if amount_to_spend > 1: 
                 qty = amount_to_spend / price
-                
-                # Làm tròn lô chứng khoán
                 if "Stock" in market or "VNIndex" in market:
                     qty = int(qty // 100) * 100
                 
                 if qty > 0:
-                    cost = qty * price
                     stock += qty
-                    cash -= cost
-                    note = f"MUA {int(percent*100)}%" # VD: MUA 50%
+                    cash -= qty * price
+                    note = f"MUA {int(percent*100)}%"
                     display_label = "MUA"
-
-        # XỬ LÝ BÁN
-        elif action == "BÁN":
-            # Tính lượng hàng muốn bán
-            qty_to_sell = stock * percent
             
-            # Làm tròn lô chứng khoán
+            # Nếu muốn mua nhưng không đủ tiền -> Vẫn là "GIỮ" (đang full cổ)
+            if display_label != "MUA" and stock > 0:
+                display_label = "✊ GIỮ"
+
+        elif action == "BÁN":
+            qty_to_sell = stock * percent
             if "Stock" in market or "VNIndex" in market:
                 qty_to_sell = int(qty_to_sell // 100) * 100
-                if qty_to_sell > stock: qty_to_sell = stock # Fix lỗi làm tròn
+                if qty_to_sell > stock: qty_to_sell = stock
             
             if qty_to_sell > 0:
                 stock -= qty_to_sell
                 cash += qty_to_sell * price
                 note = f"BÁN {int(percent*100)}%"
                 display_label = "BÁN"
+            
+            # Nếu muốn bán nhưng không có hàng -> Vẫn là "KHÔNG MUA"
+            if display_label != "BÁN" and stock == 0:
+                display_label = "⛔ KHÔNG MUA"
 
-        # XỬ LÝ TRẠNG THÁI "KHÔNG MUA" vs "GIỮ"
-        else: # Action là GIỮ
-            if stock > 0:
-                display_label = "✊ GIỮ" # Đang gồng lãi/lỗ
-            else:
-                display_label = "⛔ KHÔNG MUA" # Đang cầm tiền, đứng ngoài quan sát
+        else: # Tín hiệu là GIỮ
+            if stock > 0: display_label = "✊ GIỮ"
+            else: display_label = "⛔ KHÔNG MUA"
 
         equity = cash + (stock * price)
-        roi = (equity - capital) / capital
-
+        
         # --- GHI VÀO NOTION ---
-        # Điều kiện: Chưa tồn tại trong lịch sử
         if time_sig not in existing:
+            roi = (equity - capital) / capital
             icon = "⚪"
             if "MUA" in display_label: icon = "🟢"
             if "BÁN" in display_label: icon = "🔴"
@@ -263,19 +244,19 @@ def run_campaign(config):
                     "Giá": {"number": price},
                     "INPUT MÃ": {"rich_text": [{"text": {"content": key}}]},
                     "Loại Lệnh": {"select": {"name": display_label}},
-                    "Số Lượng": {"number": qty if note else 0}, # Chỉ ghi số lượng nếu có lệnh
+                    "Số Lượng": {"number": qty if note else 0},
                     "Số Dư": {"number": equity},
                     "ROI": {"number": roi},
                     "Giờ Giao Dịch": {"date": {"start": dt.isoformat()}} 
                 }
             }
             notion_request("pages", "POST", payload)
-            print(f"   ✅ [GHI] {title} | ROI: {roi:.2%}")
+            print(f"   ✅ [GHI] {title}")
             existing.add(time_sig)
             new_logs_count += 1
 
     if new_logs_count == 0:
-        print("   -> Dữ liệu đã đồng bộ (Không có lệnh mới).")
+        print("   -> Dữ liệu đã đồng bộ.")
 
 # --- MAIN ---
 print("📡 Đang kết nối Notion...")
