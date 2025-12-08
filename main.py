@@ -8,11 +8,17 @@ from datetime import datetime, timezone, timedelta
 import ccxt
 from lunardate import LunarDate
 
-# --- 1. LẤY CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG (BẢO MẬT) ---
-# Không điền Token trực tiếp ở đây nữa, GitHub sẽ tự điền
+# --- 1. LẤY CẤU HÌNH TỪ BIẾN MÔI TRƯỜNG (GITHUB SECRETS) ---
+# Code sẽ tự tìm trong "Két sắt" của GitHub để lấy khóa
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 CONFIG_DB_ID = os.environ.get("CONFIG_DB_ID")
 LOG_DB_ID    = os.environ.get("LOG_DB_ID")
+
+# Kiểm tra xem có lấy được khóa không (để debug)
+if not NOTION_TOKEN or not CONFIG_DB_ID or not LOG_DB_ID:
+    print("❌ LỖI: Không tìm thấy Token/ID trong biến môi trường.")
+    print("👉 Hãy kiểm tra lại mục Settings > Secrets and variables > Actions trên GitHub.")
+    exit(1)
 
 def extract_id(text):
     if not text: return ""
@@ -22,10 +28,8 @@ def extract_id(text):
 CONFIG_DB_ID = extract_id(CONFIG_DB_ID)
 LOG_DB_ID = extract_id(LOG_DB_ID)
 
-crypto_exchange = ccxt.kucoin()
-
 # --- 2. HÀM GỌI API CHỨNG KHOÁN (DNSE) ---
-def get_stock_price(symbol, days=5):
+def get_stock_price(symbol, days=10):
     try:
         to_ts = int(time.time())
         from_ts = to_ts - (days * 24 * 3600)
@@ -42,7 +46,7 @@ def get_stock_price(symbol, days=5):
         return data
     except: return []
 
-# --- 3. HÀM NOTION ---
+# --- 3. HÀM GỌI NOTION ---
 def notion_request(endpoint, method="POST", payload=None):
     url = f"https://api.notion.com/v1/{endpoint}"
     headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
@@ -52,7 +56,27 @@ def notion_request(endpoint, method="POST", payload=None):
         return response.json() if response.status_code == 200 else None
     except: return None
 
-# --- 4. LOGIC KINH DỊCH ---
+# --- 4. HÀM KIỂM TRA LOG CŨ ---
+def get_latest_log_time(symbol):
+    payload = {
+        "filter": {"property": "Mã", "rich_text": {"contains": symbol}},
+        "sorts": [{"property": "Thời Gian", "direction": "descending"}],
+        "page_size": 1
+    }
+    data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
+    
+    if data and data['results']:
+        try:
+            title_text = data['results'][0]['properties']['Thời Gian']['title'][0]['plain_text']
+            match = re.search(r'(\d{2}:\d{2} \d{2}/\d{2})', title_text)
+            if match:
+                current_year = datetime.now().year
+                dt = datetime.strptime(f"{match.group(1)}/{current_year}", '%H:%M %d/%m/%Y')
+                return dt.replace(tzinfo=timezone(timedelta(hours=7)))
+        except: pass
+    return datetime(2000, 1, 1, tzinfo=timezone(timedelta(hours=7)))
+
+# --- 5. LOGIC KINH DỊCH ---
 king_wen_matrix = [[1, 10, 13, 25, 44, 6, 33, 12], [43, 58, 49, 17, 28, 47, 31, 45], [14, 38, 30, 21, 50, 64, 56, 35], [34, 54, 55, 51, 32, 40, 62, 16], [9, 61, 37, 42, 57, 59, 53, 20], [5, 60, 63, 3, 48, 29, 39, 8], [26, 41, 22, 27, 18, 4, 52, 23], [11, 19, 36, 24, 46, 7, 15, 2]]
 
 def calculate_hexagram(dt_real):
@@ -86,8 +110,9 @@ def analyze_sentiment(text):
     b, s = sum(1 for w in buys if w in text), sum(1 for w in sells if w in text)
     return "MUA" if b > s else ("BÁN" if s > b else "GIỮ")
 
-# --- 5. CHẠY CHIẾN DỊCH ---
-def run_campaign(props):
+# --- 6. CHẠY CHIẾN DỊCH ---
+def run_campaign(config):
+    props = config['properties']
     try:
         name = props['Tên Chiến Dịch']['title'][0]['plain_text']
         market = props['Sàn Giao Dịch']['select']['name']
@@ -95,33 +120,32 @@ def run_campaign(props):
         capital = props['Vốn Ban Đầu']['number']
     except: return
 
-    print(f"🚀 Running: {name} ({symbol})")
+    print(f"🚀 Check: {name} ({symbol})")
     
     data = []
+    # Crypto
     if "Binance" in market or "Crypto" in market:
         try:
-            ohlcv = crypto_exchange.fetch_ohlcv(symbol, '1h', limit=48)
+            exchange = ccxt.kucoin()
+            ohlcv = exchange.fetch_ohlcv(symbol, '1h', limit=48)
             for c in ohlcv: data.append({"t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))), "p": c[4]})
         except: pass
-    elif "Stock" in market:
+    # Stock
+    elif "Stock" in market or "VNIndex" in market:
         data = get_stock_price(symbol)
 
     if not data: return
 
-    # Chỉ chạy nến mới nhất để tiết kiệm tài nguyên GitHub
-    # Nhưng lần đầu chạy full để test
     cash, stock, equity = capital, 0, capital
-    
-    # Load Advice (Giả lập file nếu không có, hoặc tải từ URL nếu bạn host file csv)
-    # Để đơn giản, bot sẽ chạy logic mà không cần file CSV (mặc định GIỮ nếu không thấy file)
-    # *Nâng cao: Bạn có thể đưa nội dung CSV vào biến môi trường hoặc file trong repo
-    # Ở đây tôi demo chạy mà không cần file CSV (Sentiment=GIỮ) hoặc bạn upload file lên Repo
     try:
         df_adv = pd.read_csv('data_loi_khuyen.csv')
         adv_map = dict(zip(df_adv['KEY_ID'], df_adv['Lời Khuyên']))
     except: adv_map = {}
 
-    for item in data[-12:]: # Chỉ quét 12 giờ gần nhất
+    last_log_time = get_latest_log_time(symbol)
+    new_logs = 0
+
+    for item in data[-48:]:
         dt, price = item['t'], item['p']
         key = calculate_hexagram(dt)
         signal = analyze_sentiment(adv_map.get(key, ""))
@@ -136,14 +160,15 @@ def run_campaign(props):
             
         equity = cash + stock*price
         
-        # Chỉ ghi log nếu là nến mới nhất (tránh spam khi chạy tự động)
-        # Hoặc ghi tất cả nếu có lệnh
-        if note:
+        if note and dt > last_log_time:
             roi_val = (equity - capital) / capital
+            icon = "🟢" if signal == "MUA" else "🔴"
+            title = f"{icon} {signal} | {dt.strftime('%H:%M %d/%m')}"
+            
             payload = {
                 "parent": {"database_id": LOG_DB_ID},
                 "properties": {
-                    "Thời Gian": {"title": [{"text": {"content": dt.strftime('%Y-%m-%d %H:%M')}}]},
+                    "Thời Gian": {"title": [{"text": {"content": title}}]},
                     "Mã": {"rich_text": [{"text": {"content": f"{symbol} ({name})" }}]}, 
                     "Giá": {"number": price},
                     "INPUT MÃ": {"rich_text": [{"text": {"content": key}}]},
@@ -154,11 +179,15 @@ def run_campaign(props):
                 }
             }
             notion_request("pages", "POST", payload)
-            print(f"   -> {dt.strftime('%H:%M')} {signal} | ROI: {roi_val:.2%}")
+            print(f"   [NEW] {title} | ROI: {roi_val:.2%}")
+            new_logs += 1
+            last_log_time = dt
 
-# --- MAIN ---
+    if new_logs == 0: print("   -> Không có lệnh mới.")
+
+# --- 7. MAIN ---
 query = {"filter": {"property": "Trạng Thái", "status": {"equals": "Đang chạy"}}}
 res = notion_request(f"databases/{CONFIG_DB_ID}/query", "POST", query)
 if res and 'results' in res:
-    for cfg in res['results']: run_campaign(cfg['properties'])
-else: print("❌ Connection Failed")
+    for cfg in res['results']: run_campaign(cfg)
+else: print("❌ Lỗi kết nối Notion hoặc không có chiến dịch.")
