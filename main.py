@@ -1,3 +1,4 @@
+# @title 🚀 BƯỚC 4 (V26 - FORCE WRITE): GHI ĐÈ TUYỆT ĐỐI (KHÔNG CHECK TRÙNG)
 import os
 import requests
 import pandas as pd
@@ -5,15 +6,16 @@ import time
 import re
 import io
 import sys
+import random
 from datetime import datetime, timezone, timedelta
 
-# --- 1. CẤU HÌNH (LẤY TỪ GITHUB SECRETS) ---
+# --- 1. CẤU HÌNH ---
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 CONFIG_DB_ID = os.environ.get("CONFIG_DB_ID")
 LOG_DB_ID    = os.environ.get("LOG_DB_ID")
 
 if not NOTION_TOKEN or not CONFIG_DB_ID or not LOG_DB_ID:
-    print("❌ LỖI: Chưa cấu hình Secrets.")
+    print("❌ LỖI: Thiếu Secrets.")
     sys.exit(1)
 
 def extract_id(text):
@@ -24,15 +26,7 @@ def extract_id(text):
 CONFIG_DB_ID = extract_id(CONFIG_DB_ID)
 LOG_DB_ID = extract_id(LOG_DB_ID)
 
-# --- 2. DỮ LIỆU DỰ PHÒNG ---
-BACKUP_CSV = """KEY_ID,Lời Khuyên
-G1-B1,Đại cát, nên mua vào.
-G1-B43,Quyết liệt, bán ra ngay.
-G23-B4,Mông lung xấu, bán cắt lỗ.
-G23-B35,Tấn tới tốt đẹp, mua vào.
-"""
-
-# --- 3. THƯ VIỆN ---
+# --- 2. THƯ VIỆN ---
 try:
     import ccxt
     from lunardate import LunarDate
@@ -40,44 +34,61 @@ except ImportError: pass
 import ccxt
 from lunardate import LunarDate
 
-# --- 4. HÀM API CHỨNG KHOÁN (DNSE) ---
-def get_stock_data(symbol):
-    try:
-        to_ts = int(time.time())
-        from_ts = to_ts - (5 * 24 * 3600)
-        url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=headers).json()
-        data = []
-        if 't' in res and res['t']:
-            for i in range(len(res['t'])):
-                data.append({
-                    "t": datetime.fromtimestamp(res['t'][i], tz=timezone(timedelta(hours=7))),
-                    "p": float(res['c'][i])
-                })
-        return data
-    except Exception as e:
-        print(f"❌ Lỗi Stock {symbol}: {e}")
-        return []
+# --- 3. DỮ LIỆU DỰ PHÒNG ---
+BACKUP_CSV = """KEY_ID,Lời Khuyên
+G1-B1,Đại cát, nên mua vào.
+G1-B43,Quyết liệt, bán ra ngay.
+G23-B4,Mông lung xấu, bán cắt lỗ.
+G23-B35,Tấn tới tốt đẹp, mua vào.
+"""
 
-# --- 5. HÀM NOTION ---
+# --- 4. HÀM NOTION ---
 def notion_request(endpoint, method="POST", payload=None):
     url = f"https://api.notion.com/v1/{endpoint}"
     headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     try:
         if method == "POST": response = requests.post(url, headers=headers, json=payload)
         else: response = requests.get(url, headers=headers)
-        return response.json() if response.status_code == 200 else None
-    except: return None
+        return response.json()
+    except Exception as e:
+        print(f"❌ Lỗi mạng: {e}")
+        return None
+
+# --- 5. HÀM LẤY DATA (DNSE + CRYPTO) ---
+def get_market_data(market_type, symbol):
+    data = []
+    # Lấy 48h gần nhất (Bỏ qua logic ngày Âm lịch phức tạp để đảm bảo có data test trước)
+    to_ts = int(time.time())
+    from_ts = to_ts - (48 * 3600) 
+    
+    try:
+        if "Binance" in market_type or "Crypto" in market_type:
+            xc = ccxt.kucoin()
+            ohlcv = xc.fetch_ohlcv(symbol, '1h', limit=48)
+            for c in ohlcv: 
+                data.append({"t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))), "p": c[4]})
+        
+        elif "Stock" in market_type or "VNIndex" in market_type:
+            url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            res = requests.get(url, headers=headers).json()
+            if 't' in res and res['t']:
+                for i in range(len(res['t'])):
+                    data.append({
+                        "t": datetime.fromtimestamp(res['t'][i], tz=timezone(timedelta(hours=7))),
+                        "p": float(res['c'][i])
+                    })
+    except Exception as e:
+        print(f"❌ Lỗi lấy data {symbol}: {e}")
+    
+    return data
 
 # --- 6. HÀM LOAD FILE ---
 def load_advice_data():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(current_dir, 'data_loi_khuyen.csv')
     if os.path.exists(file_path):
-        print(f"✅ Đã tìm thấy file CSV.")
         return pd.read_csv(file_path)
-    print("⚡ Dùng dữ liệu dự phòng.")
     return pd.read_csv(io.StringIO(BACKUP_CSV))
 
 # --- 7. LOGIC KINH DỊCH ---
@@ -110,32 +121,7 @@ def analyze_sentiment(text):
     if s_score > b_score: return "BÁN"
     return "GIỮ"
 
-# --- 8. KIỂM TRA LỊCH SỬ ---
-def get_existing_signatures(symbol):
-    payload = {
-        "filter": {"property": "Mã", "rich_text": {"contains": symbol}},
-        "sorts": [{"property": "Giờ Giao Dịch", "direction": "descending"}], # Sort theo cột Date chuẩn hơn
-        "page_size": 50 
-    }
-    # Fallback nếu cột Date chưa có dữ liệu thì sort theo Title cũ
-    try:
-        data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
-    except:
-        payload["sorts"] = [{"property": "Thời Gian", "direction": "descending"}]
-        data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
-
-    s = set()
-    if data and 'results' in data:
-        for p in data['results']:
-            try:
-                # Lấy chữ ký từ Tiêu đề cũ (để tương thích ngược)
-                t = p['properties']['Thời Gian']['title'][0]['plain_text']
-                match = re.search(r'(\d{2}:\d{2} \d{2}/\d{2})', t)
-                if match: s.add(match.group(1))
-            except: pass
-    return s
-
-# --- 9. HÀM CHẠY ---
+# --- 8. HÀM CHẠY CHIẾN DỊCH (FORCE WRITE MODE) ---
 def run_campaign(config):
     try:
         name = config['properties']['Tên Chiến Dịch']['title'][0]['plain_text']
@@ -144,30 +130,27 @@ def run_campaign(config):
         capital = config['properties']['Vốn Ban Đầu']['number']
     except: return
 
-    print(f"\n🚀 Checking: {name} ({symbol})")
+    print(f"\n🚀 Processing: {name} ({symbol})")
     
-    data = []
-    if "Binance" in market or "Crypto" in market:
-        try:
-            xc = ccxt.kucoin()
-            ohlcv = xc.fetch_ohlcv(symbol, '1h', limit=48)
-            for c in ohlcv: data.append({"t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))), "p": c[4]})
-        except: pass
-    elif "Stock" in market or "VNIndex" in market:
-        data = get_stock_data(symbol)
-
+    # 1. Lấy Data
+    data = get_market_data(market, symbol)
     if not data:
-        print("   -> ❌ Không có dữ liệu giá.")
+        print("   -> ❌ Không có dữ liệu giá. (Check lại mã hoặc giờ giao dịch)")
         return
+    print(f"   -> Đã lấy {len(data)} cây nến.")
 
+    # 2. Nạp Advice
     df_adv = load_advice_data()
     adv_map = dict(zip(df_adv['KEY_ID'], df_adv['Lời Khuyên']))
 
-    existing = get_existing_signatures(symbol)
+    # 3. Logic Giao Dịch
     cash, stock, equity = capital, 0, capital
-    new_logs = 0
+    log_count = 0
 
-    for item in data[-48:]:
+    # ⚠️ DISABLE CHECK TRÙNG LẶP (Force Write All)
+    # existing_timestamps = get_existing_signatures... (Bỏ qua bước này)
+
+    for item in data: # Chạy hết các nến lấy được
         dt, price = item['t'], item['p']
         time_sig = dt.strftime('%H:%M %d/%m')
         
@@ -178,48 +161,60 @@ def run_campaign(config):
         qty, note = 0, ""
         
         if signal == "MUA" and cash > capital*0.01:
-            qty = cash/price; stock=qty; cash=0; note="MUA"
+            qty = cash / price
+            if "Stock" in market or "VNIndex" in market: qty = int(qty // 100) * 100
+            if qty > 0: stock += qty; cash -= qty * price; note = "MUA"
         elif signal == "BÁN" and stock > 0:
-            cash=stock*price; qty=stock; stock=0; note="BÁN"
-        
+            cash += stock * price; qty = stock; stock = 0; note = "BÁN"
+            
         equity = cash + stock*price
         
-        # GHI LOG NẾU CÓ LỆNH VÀ CHƯA TỒN TẠI
-        if note and (time_sig not in existing):
-            roi = (equity - capital) / capital
-            icon = "🟢" if signal == "MUA" else "🔴"
-            title = f"{icon} {signal} | {time_sig}"
-            
-            payload = {
-                "parent": {"database_id": LOG_DB_ID},
-                "properties": {
-                    "Thời Gian": {"title": [{"text": {"content": title}}]},
-                    "Mã": {"rich_text": [{"text": {"content": f"{symbol} ({name})" }}]}, 
-                    "Giá": {"number": price},
-                    "INPUT MÃ": {"rich_text": [{"text": {"content": key}}]},
-                    "Loại Lệnh": {"select": {"name": signal}},
-                    "Số Lượng": {"number": qty},
-                    "Số Dư": {"number": equity},
-                    "ROI": {"number": roi},
-                    # THÊM CỘT MỚI Ở ĐÂY:
-                    "Giờ Giao Dịch": {"date": {"start": dt.isoformat()}} 
-                }
-            }
-            notion_request("pages", "POST", payload)
-            print(f"   ✅ [GHI MỚI] {title}")
-            existing.add(time_sig)
-            new_logs += 1
+        # LOGIC GHI MỚI: GHI TẤT CẢ (KỂ CẢ GIỮ)
+        # Để đảm bảo bạn thấy dữ liệu trên biểu đồ
+        roi = (equity - capital) / capital
+        
+        display_signal = note if note else "GIỮ" # Nếu không có lệnh thì hiện GIỮ
+        
+        # Icon
+        if display_signal == "MUA": icon = "🟢"
+        elif display_signal == "BÁN": icon = "🔴"
+        else: icon = "⚪"
 
-    if new_logs == 0:
-        print("   -> Dữ liệu đã đồng bộ.")
+        title = f"{icon} {display_signal} | {time_sig}"
+        
+        payload = {
+            "parent": {"database_id": LOG_DB_ID},
+            "properties": {
+                "Thời Gian": {"title": [{"text": {"content": title}}]},
+                "Mã": {"rich_text": [{"text": {"content": f"{symbol} ({name})" }}]}, 
+                "Giá": {"number": price},
+                "INPUT MÃ": {"rich_text": [{"text": {"content": key}}]},
+                "Loại Lệnh": {"select": {"name": display_signal}}, # Ghi cả GIỮ
+                "Số Lượng": {"number": qty},
+                "Số Dư": {"number": equity},
+                "ROI": {"number": roi},
+                "Giờ Giao Dịch": {"date": {"start": dt.isoformat()}} 
+            }
+        }
+        
+        # Gửi Request
+        notion_request("pages", "POST", payload)
+        print(f"   [GHI] {title} | ROI: {roi:.2%}")
+        log_count += 1
+
+    print(f"   ✅ Đã ghi xong {log_count} bản ghi vào Notion.")
 
 # --- MAIN ---
-print("📡 Đang kết nối Notion...")
+print("📡 BẮT ĐẦU CHẠY (CHẾ ĐỘ GHI ĐÈ)...")
+# Bỏ qua bộ lọc Status Notion để chắc chắn lấy được Config
+# res = notion_request(f"databases/{CONFIG_DB_ID}/query", "POST", {}) 
+# Dùng lại bộ lọc Status nếu bạn chắc chắn đã set đúng
 query = {"filter": {"property": "Trạng Thái", "status": {"equals": "Đang chạy"}}}
 res = notion_request(f"databases/{CONFIG_DB_ID}/query", "POST", query)
 
 if res and 'results' in res:
-    print(f"✅ Tìm thấy {len(res['results'])} chiến dịch.")
+    print(f"✅ Tìm thấy {len(res['results'])} cấu hình.")
     for cfg in res['results']: run_campaign(cfg)
 else:
-    print("❌ Lỗi kết nối Notion (Hoặc không có chiến dịch). Check Token/ID.")
+    print("❌ Lỗi Notion (Hoặc không có dòng 'Đang chạy').")
+    if res: print(f"Chi tiết: {res}")
