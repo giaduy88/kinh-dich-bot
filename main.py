@@ -24,16 +24,11 @@ def extract_id(text):
 CONFIG_DB_ID = extract_id(CONFIG_DB_ID)
 LOG_DB_ID = extract_id(LOG_DB_ID)
 
-# --- 2. CẤU HÌNH THỜI GIAN BẮT ĐẦU (THEO YÊU CẦU CỦA BẠN) ---
-# Ngày 18/10 năm Ất Tỵ (2025) lúc 23h
-LUNAR_START_CFG = {
-    "year": 2025,  # Năm Ất Tỵ
-    "month": 10,   # Tháng 10 Âm
-    "day": 18,     # Ngày 18 Âm
-    "hour": 23     # 23h đêm
-}
+# --- CẤU HÌNH NGÀY BẮT ĐẦU (18/10 Âm lịch) ---
+LUNAR_TARGET = {"day": 18, "month": 10, "hour": 23} 
+# Lưu ý: Năm sẽ được tự động xử lý bên dưới để tránh lỗi "Tương lai"
 
-# --- 3. DỮ LIỆU DỰ PHÒNG ---
+# --- 2. DỮ LIỆU DỰ PHÒNG ---
 BACKUP_CSV = """KEY_ID,Lời Khuyên
 G1-B1,Đại cát, nên mua vào.
 G1-B43,Quyết liệt, bán ra ngay.
@@ -41,7 +36,7 @@ G23-B4,Mông lung xấu, bán cắt lỗ.
 G23-B35,Tấn tới tốt đẹp, mua vào.
 """
 
-# --- 4. THƯ VIỆN & HÀM CHUYỂN ĐỔI NGÀY ---
+# --- 3. THƯ VIỆN ---
 try:
     import ccxt
     from lunardate import LunarDate
@@ -49,40 +44,39 @@ except ImportError: pass
 import ccxt
 from lunardate import LunarDate
 
-def get_start_timestamp_from_lunar():
-    """Chuyển đổi ngày Âm Lịch cấu hình sang Timestamp Dương Lịch"""
+# --- 4. HÀM TÍNH TOÁN THỜI GIAN THÔNG MINH ---
+def get_smart_start_timestamp():
+    # Lấy năm hiện tại của Server
+    now = datetime.now()
+    year = now.year 
+    
+    # Tính ngày Âm Lịch của năm nay
     try:
-        # 1. Đổi sang Dương Lịch
-        # Lưu ý: Thư viện lunardate đổi chính xác theo lịch vạn niên
-        solar_date = LunarDate(
-            LUNAR_START_CFG["year"], 
-            LUNAR_START_CFG["month"], 
-            LUNAR_START_CFG["day"]
-        ).toSolarDate()
+        solar = LunarDate(year, LUNAR_TARGET["month"], LUNAR_TARGET["day"]).toSolarDate()
+        dt_start = datetime(solar.year, solar.month, solar.day, LUNAR_TARGET["hour"], 0, 0)
         
-        # 2. Tạo datetime object (Múi giờ +7)
-        tz = timezone(timedelta(hours=7))
-        dt_start = datetime(
-            solar_date.year, 
-            solar_date.month, 
-            solar_date.day, 
-            LUNAR_START_CFG["hour"], 0, 0, tzinfo=tz
-        )
-        
-        print(f"📅 Cấu hình chạy từ: 23h 18/10 Âm Lịch (Ất Tỵ)")
-        print(f"   -> Tương đương Dương Lịch: {dt_start.strftime('%H:%M %d/%m/%Y')}")
-        
+        # Nếu ngày tính ra nằm ở tương lai (Ví dụ: Server đang 2024, mà Âm lịch tháng 10 chưa tới)
+        # Hoặc nếu bạn cấu hình năm 2025 mà server đang 2024
+        if dt_start > now:
+            print(f"⚠️ Cảnh báo: Ngày 18/10 Âm ({dt_start.strftime('%d/%m/%Y')}) là tương lai!")
+            print("   -> Tự động lùi về 30 ngày trước để có dữ liệu chạy.")
+            dt_start = now - timedelta(days=30)
+        else:
+            print(f"📅 Mốc thời gian bắt đầu: {dt_start.strftime('%H:%M %d/%m/%Y')} (Dương lịch)")
+            
         return int(dt_start.timestamp())
-    except Exception as e:
-        print(f"❌ Lỗi tính ngày Âm Lịch: {e}")
-        # Fallback về 48h trước nếu lỗi
-        return int(time.time()) - (48 * 3600)
+    except:
+        # Fallback an toàn nhất
+        return int(time.time()) - (30 * 24 * 3600)
 
 # --- 5. HÀM API CHỨNG KHOÁN (DNSE) ---
 def get_stock_data(symbol, start_ts):
     try:
         to_ts = int(time.time())
-        # API DNSE lấy từ start_ts đến hiện tại
+        # Nếu khoảng cách quá ngắn (<24h), lùi thêm 2 ngày để chắc chắn có data (tránh cuối tuần)
+        if to_ts - start_ts < 86400:
+            start_ts -= (2 * 86400)
+            
         url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={start_ts}&to={to_ts}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers).json()
@@ -120,10 +114,8 @@ def load_advice_data():
 king_wen_matrix = [[1, 10, 13, 25, 44, 6, 33, 12], [43, 58, 49, 17, 28, 47, 31, 45], [14, 38, 30, 21, 50, 64, 56, 35], [34, 54, 55, 51, 32, 40, 62, 16], [9, 61, 37, 42, 57, 59, 53, 20], [5, 60, 63, 3, 48, 29, 39, 8], [26, 41, 22, 27, 18, 4, 52, 23], [11, 19, 36, 24, 46, 7, 15, 2]]
 
 def calculate_hexagram(dt):
-    # Logic: 23h hôm nay tính là ngày hôm sau (Dạ Tý)
     if dt.hour == 23: dt_l = dt + timedelta(days=1)
     else: dt_l = dt
-    
     lunar = LunarDate.fromSolarDate(dt_l.year, dt_l.month, dt_l.day)
     chi = 1 if dt.hour==23 or dt.hour==0 else ((dt.hour+1)//2 + 1 if dt.hour%2!=0 else dt.hour//2 + 1)
     base = ((lunar.year - 1984)%12 + 1) + lunar.month + lunar.day
@@ -140,8 +132,8 @@ def calculate_hexagram(dt):
 def analyze_sentiment(text):
     if not isinstance(text, str): return "GIỮ"
     text = text.lower()
-    buys = ['mua', 'lợi', 'tốt', 'lãi', 'cát', 'lên', 'tăng', 'hanh thông']
-    sells = ['bán', 'xấu', 'lỗ', 'nguy', 'hại', 'xuống', 'giảm', 'trở ngại', 'kẹt']
+    buys = ['mua', 'lợi', 'tốt', 'lãi', 'cát', 'lên', 'tăng', 'hanh thông', 'hưng thịnh']
+    sells = ['bán', 'xấu', 'lỗ', 'nguy', 'hại', 'xuống', 'giảm', 'trở ngại', 'kẹt', 'suy']
     b_score = sum(1 for w in buys if w in text)
     s_score = sum(1 for w in sells if w in text)
     if b_score > s_score: return "MUA"
@@ -163,11 +155,13 @@ def get_existing_signatures(symbol):
     if data and 'results' in data:
         for p in data['results']:
             try:
-                # Dùng chữ ký thời gian từ cột Title để check trùng
-                t = p['properties']['Thời Gian']['title'][0]['plain_text']
-                match = re.search(r'(\d{2}:\d{2} \d{2}/\d{2})', t)
-                if match: s.add(match.group(1))
-            except: pass
+                # Lấy ngày từ cột Date để chuẩn xác nhất
+                d = p['properties']['Giờ Giao Dịch']['date']['start']
+                # Chuyển về định dạng HH:MM dd/mm
+                dt_obj = datetime.fromisoformat(d.replace('Z', '+00:00')).astimezone(timezone(timedelta(hours=7)))
+                s.add(dt_obj.strftime('%H:%M %d/%m'))
+            except: 
+                pass
     return s
 
 # --- 10. HÀM CHẠY CHIẾN DỊCH ---
@@ -179,14 +173,12 @@ def run_campaign(config, start_ts):
         capital = config['properties']['Vốn Ban Đầu']['number']
     except: return
 
-    print(f"\n🚀 Checking: {name} ({symbol})")
+    print(f"\n🚀 Processing: {name} ({symbol})")
     
     data = []
-    # 1. Lấy dữ liệu từ Mốc Thời Gian đã định
     if "Binance" in market or "Crypto" in market:
         try:
             xc = ccxt.kucoin()
-            # ccxt dùng mili-seconds
             ohlcv = xc.fetch_ohlcv(symbol, '1h', since=start_ts*1000)
             for c in ohlcv: data.append({"t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))), "p": c[4]})
         except: pass
@@ -194,15 +186,22 @@ def run_campaign(config, start_ts):
         data = get_stock_data(symbol, start_ts)
 
     if not data:
-        print("   -> ❌ Không có dữ liệu giá.")
+        print("   -> ❌ Không có dữ liệu giá từ mốc đã chọn.")
         return
-
-    print(f"   -> Đã lấy {len(data)} cây nến từ mốc khởi tạo.")
+    
+    print(f"   -> Đã lấy được {len(data)} cây nến.")
 
     df_adv = load_advice_data()
     adv_map = dict(zip(df_adv['KEY_ID'], df_adv['Lời Khuyên']))
 
     existing = get_existing_signatures(symbol)
+    
+    # CHẾ ĐỘ LẤP ĐẦY: Nếu lịch sử trống -> Ghi tất cả (kể cả GIỮ)
+    FILL_MODE = False
+    if len(existing) == 0:
+        print("   -> 📢 Lịch sử trống. Kích hoạt chế độ 'LẤP ĐẦY' (Ghi mọi nến để vẽ chart).")
+        FILL_MODE = True
+
     cash, stock, equity = capital, 0, capital
     new_logs = 0
 
@@ -216,21 +215,34 @@ def run_campaign(config, start_ts):
         
         qty, note = 0, ""
         
-        # Logic giao dịch
         if signal == "MUA" and cash > capital*0.01:
             qty = cash / price
             if "Stock" in market or "VNIndex" in market: qty = int(qty // 100) * 100
             if qty > 0: stock += qty; cash -= qty * price; note = "MUA"
         elif signal == "BÁN" and stock > 0:
-            cash=stock*price; qty=stock; stock=0; note="BÁN"
-        
+            cash += stock * price; qty = stock; stock = 0; note = "BÁN"
+            
         equity = cash + stock*price
         
-        # GHI LOG
-        if note and (time_sig not in existing):
+        # LOGIC GHI:
+        # 1. Nếu FILL_MODE=True: Ghi hết (để có dữ liệu biểu đồ)
+        # 2. Nếu FILL_MODE=False: Chỉ ghi khi có Lệnh (Mua/Bán) và chưa tồn tại
+        should_write = False
+        if FILL_MODE:
+            should_write = True
+        elif note and (time_sig not in existing):
+            should_write = True
+
+        if should_write and (time_sig not in existing):
             roi = (equity - capital) / capital
-            icon = "🟢" if signal == "MUA" else "🔴"
-            title = f"{icon} {signal} | {time_sig}"
+            
+            # Icon
+            if note == "MUA": icon = "🟢"
+            elif note == "BÁN": icon = "🔴"
+            else: icon = "⚪" # GIỮ
+
+            display_signal = note if note else "GIỮ"
+            title = f"{icon} {display_signal} | {time_sig}"
             
             payload = {
                 "parent": {"database_id": LOG_DB_ID},
@@ -239,7 +251,7 @@ def run_campaign(config, start_ts):
                     "Mã": {"rich_text": [{"text": {"content": f"{symbol} ({name})" }}]}, 
                     "Giá": {"number": price},
                     "INPUT MÃ": {"rich_text": [{"text": {"content": key}}]},
-                    "Loại Lệnh": {"select": {"name": signal}},
+                    "Loại Lệnh": {"select": {"name": display_signal}},
                     "Số Lượng": {"number": qty},
                     "Số Dư": {"number": equity},
                     "ROI": {"number": roi},
@@ -247,7 +259,7 @@ def run_campaign(config, start_ts):
                 }
             }
             notion_request("pages", "POST", payload)
-            print(f"   ✅ [GHI MỚI] {title}")
+            print(f"   ✅ [GHI] {title}")
             existing.add(time_sig)
             new_logs += 1
 
@@ -256,16 +268,14 @@ def run_campaign(config, start_ts):
 
 # --- MAIN ---
 print("📡 Đang kết nối Notion...")
-# 1. Tính toán thời gian bắt đầu
-START_TS = get_start_timestamp_from_lunar()
+START_TS = get_smart_start_timestamp() # Tự động tính ngày hợp lý
 
-# 2. Quét các chiến dịch
 query = {"filter": {"property": "Trạng Thái", "status": {"equals": "Đang chạy"}}}
 res = notion_request(f"databases/{CONFIG_DB_ID}/query", "POST", query)
 
 if res and 'results' in res:
     print(f"✅ Tìm thấy {len(res['results'])} chiến dịch.")
     for cfg in res['results']: 
-        run_campaign(cfg, START_TS) # Truyền mốc thời gian vào
+        run_campaign(cfg, START_TS)
 else:
     print("❌ Lỗi kết nối Notion. Check Token/ID.")
