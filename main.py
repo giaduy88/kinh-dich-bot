@@ -7,13 +7,13 @@ import io
 import sys
 from datetime import datetime, timezone, timedelta
 
-# --- 1. CẤU HÌNH (LẤY TỪ GITHUB SECRETS) ---
+# --- 1. CẤU HÌNH ---
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 CONFIG_DB_ID = os.environ.get("CONFIG_DB_ID")
 LOG_DB_ID    = os.environ.get("LOG_DB_ID")
 
 if not NOTION_TOKEN or not CONFIG_DB_ID or not LOG_DB_ID:
-    print("❌ LỖI: Chưa cấu hình Secrets.")
+    print("❌ LỖI: Thiếu Secrets (NOTION_TOKEN, CONFIG_DB_ID, LOG_DB_ID).")
     sys.exit(1)
 
 def extract_id(text):
@@ -45,6 +45,7 @@ def get_stock_data(symbol):
     try:
         to_ts = int(time.time())
         from_ts = to_ts - (5 * 24 * 3600)
+        # API DNSE ổn định
         url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers).json()
@@ -75,7 +76,7 @@ def load_advice_data():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(current_dir, 'data_loi_khuyen.csv')
     if os.path.exists(file_path):
-        print(f"✅ Đã tìm thấy file CSV.")
+        print(f"✅ Đã nạp file CSV.")
         return pd.read_csv(file_path)
     print("⚡ Dùng dữ liệu dự phòng.")
     return pd.read_csv(io.StringIO(BACKUP_CSV))
@@ -114,10 +115,9 @@ def analyze_sentiment(text):
 def get_existing_signatures(symbol):
     payload = {
         "filter": {"property": "Mã", "rich_text": {"contains": symbol}},
-        "sorts": [{"property": "Giờ Giao Dịch", "direction": "descending"}], # Sort theo cột Date chuẩn hơn
+        "sorts": [{"property": "Giờ Giao Dịch", "direction": "descending"}],
         "page_size": 50 
     }
-    # Fallback nếu cột Date chưa có dữ liệu thì sort theo Title cũ
     try:
         data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
     except:
@@ -128,14 +128,13 @@ def get_existing_signatures(symbol):
     if data and 'results' in data:
         for p in data['results']:
             try:
-                # Lấy chữ ký từ Tiêu đề cũ (để tương thích ngược)
                 t = p['properties']['Thời Gian']['title'][0]['plain_text']
                 match = re.search(r'(\d{2}:\d{2} \d{2}/\d{2})', t)
                 if match: s.add(match.group(1))
             except: pass
     return s
 
-# --- 9. HÀM CHẠY ---
+# --- 9. HÀM CHẠY CHIẾN DỊCH ---
 def run_campaign(config):
     try:
         name = config['properties']['Tên Chiến Dịch']['title'][0]['plain_text']
@@ -144,20 +143,21 @@ def run_campaign(config):
         capital = config['properties']['Vốn Ban Đầu']['number']
     except: return
 
-    print(f"\n🚀 Checking: {name} ({symbol})")
+    print(f"\n🚀 Checking: {name} ({symbol}) | Market: {market}")
     
     data = []
+    # FIX LỖI: Thêm điều kiện check "VNIndex"
     if "Binance" in market or "Crypto" in market:
         try:
             xc = ccxt.kucoin()
             ohlcv = xc.fetch_ohlcv(symbol, '1h', limit=48)
             for c in ohlcv: data.append({"t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))), "p": c[4]})
         except: pass
-    elif "Stock" in market:
+    elif "Stock" in market or "VNIndex" in market: # <-- ĐÃ BỔ SUNG "VNIndex"
         data = get_stock_data(symbol)
 
     if not data:
-        print("   -> ❌ Không có dữ liệu giá.")
+        print("   -> ❌ Không có dữ liệu giá (Check lại Mã hoặc Giờ giao dịch).")
         return
 
     df_adv = load_advice_data()
@@ -178,13 +178,17 @@ def run_campaign(config):
         qty, note = 0, ""
         
         if signal == "MUA" and cash > capital*0.01:
-            qty = cash/price; stock=qty; cash=0; note="MUA"
+            qty = cash / price
+            # Logic lô chẵn cho VNIndex
+            if "Stock" in market or "VNIndex" in market:
+                qty = int(qty // 100) * 100
+            
+            if qty > 0: stock += qty; cash -= qty * price; note = "MUA"
         elif signal == "BÁN" and stock > 0:
             cash=stock*price; qty=stock; stock=0; note="BÁN"
         
         equity = cash + stock*price
         
-        # GHI LOG NẾU CÓ LỆNH VÀ CHƯA TỒN TẠI
         if note and (time_sig not in existing):
             roi = (equity - capital) / capital
             icon = "🟢" if signal == "MUA" else "🔴"
@@ -201,7 +205,6 @@ def run_campaign(config):
                     "Số Lượng": {"number": qty},
                     "Số Dư": {"number": equity},
                     "ROI": {"number": roi},
-                    # THÊM CỘT MỚI Ở ĐÂY:
                     "Giờ Giao Dịch": {"date": {"start": dt.isoformat()}} 
                 }
             }
