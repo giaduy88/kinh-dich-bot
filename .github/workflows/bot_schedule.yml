@@ -1,0 +1,29 @@
+name: Chay Bot Kinh Dich
+
+on:
+  schedule:
+    - cron: '5 * * * *' # Chạy vào phút thứ 5 mỗi tiếng (VD: 8:05, 9:05...)
+  workflow_dispatch: # Cho phép bấm nút chạy tay để test
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+
+      - name: Install libraries
+        run: |
+          pip install requests pandas ccxt lunardate
+
+      - name: Run Bot
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          CONFIG_DB_ID: ${{ secrets.CONFIG_DB_ID }}
+          LOG_DB_ID: ${{ secrets.LOG_DB_ID }}
+        run: python main.py
