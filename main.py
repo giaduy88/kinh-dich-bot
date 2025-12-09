@@ -139,7 +139,7 @@ def get_existing_signatures(symbol):
             except: pass
     return s
 
-# --- 9. HÀM CHẠY CHIẾN DỊCH ---
+# --- 9. HÀM CHẠY CHIẾN DỊCH (V29) ---
 def run_campaign(config):
     try:
         name = config['properties']['Tên Chiến Dịch']['title'][0]['plain_text']
@@ -169,7 +169,12 @@ def run_campaign(config):
 
     existing = get_existing_signatures(symbol)
     
-    cash, stock, equity = capital, 0, capital
+    # KHỞI TẠO TÀI KHOẢN GIẢ LẬP
+    cash = capital
+    stock = 0
+    equity = capital
+    avg_price = 0 # Giá vốn trung bình
+    
     new_logs_count = 0
 
     for item in data:
@@ -184,24 +189,26 @@ def run_campaign(config):
         qty, note = 0, ""
         display_label = "GIỮ"
 
-        # --- LOGIC KHỚP LỆNH (ĐÃ SỬA LỖI NGƯỠNG VỐN) ---
+        # --- LOGIC KHỚP LỆNH & TÍNH GIÁ VỐN ---
         if action == "MUA":
             amount_to_spend = cash * percent
-            # FIX LỖI: Giảm ngưỡng tối thiểu xuống 1 (để hỗ trợ cả USD và VNĐ)
-            if amount_to_spend > 1: 
+            if amount_to_spend > 1: # Fix lỗi min amount
                 qty = amount_to_spend / price
                 if "Stock" in market or "VNIndex" in market:
                     qty = int(qty // 100) * 100
                 
                 if qty > 0:
-                    stock += qty
+                    # Tính giá vốn trung bình MỚI
+                    current_value = stock * avg_price
+                    new_value = qty * price
+                    stock += qty # Cộng thêm hàng
+                    avg_price = (current_value + new_value) / stock # Update giá bình quân
+                    
                     cash -= qty * price
                     note = f"MUA {int(percent*100)}%"
                     display_label = "MUA"
             
-            # Nếu muốn mua nhưng không đủ tiền -> Vẫn là "GIỮ" (đang full cổ)
-            if display_label != "MUA" and stock > 0:
-                display_label = "✊ GIỮ"
+            if display_label != "MUA" and stock > 0: display_label = "✊ GIỮ"
 
         elif action == "BÁN":
             qty_to_sell = stock * percent
@@ -214,20 +221,35 @@ def run_campaign(config):
                 cash += qty_to_sell * price
                 note = f"BÁN {int(percent*100)}%"
                 display_label = "BÁN"
+                
+                # Nếu bán hết sạch -> Reset giá vốn
+                if stock == 0: avg_price = 0
             
-            # Nếu muốn bán nhưng không có hàng -> Vẫn là "KHÔNG MUA"
-            if display_label != "BÁN" and stock == 0:
-                display_label = "⛔ KHÔNG MUA"
+            if display_label != "BÁN" and stock == 0: display_label = "⛔ KHÔNG MUA"
 
-        else: # Tín hiệu là GIỮ
+        else: # GIỮ
             if stock > 0: display_label = "✊ GIỮ"
             else: display_label = "⛔ KHÔNG MUA"
 
-        equity = cash + (stock * price)
+        # --- TÍNH TOÁN CÁC CHỈ SỐ MỚI ---
+        # 1. Tổng tài sản
+        current_asset_value = stock * price
+        equity = cash + current_asset_value
+        
+        # 2. ROI Tổng (So với vốn ban đầu)
+        roi_total = (equity - capital) / capital
+        
+        # 3. Tỷ trọng (Asset Allocation)
+        allocation = current_asset_value / equity if equity > 0 else 0
+        
+        # 4. % Lời/Lỗ CP (Holding Performance)
+        # Chỉ tính khi đang có hàng. (Giá hiện tại - Giá vốn) / Giá vốn
+        holding_pnl = 0
+        if stock > 0 and avg_price > 0:
+            holding_pnl = (price - avg_price) / avg_price
         
         # --- GHI VÀO NOTION ---
         if time_sig not in existing:
-            roi = (equity - capital) / capital
             icon = "⚪"
             if "MUA" in display_label: icon = "🟢"
             if "BÁN" in display_label: icon = "🔴"
@@ -246,12 +268,15 @@ def run_campaign(config):
                     "Loại Lệnh": {"select": {"name": display_label}},
                     "Số Lượng": {"number": qty if note else 0},
                     "Số Dư": {"number": equity},
-                    "ROI": {"number": roi},
-                    "Giờ Giao Dịch": {"date": {"start": dt.isoformat()}} 
+                    "ROI": {"number": roi_total},
+                    "Giờ Giao Dịch": {"date": {"start": dt.isoformat()}},
+                    # HAI CỘT MỚI:
+                    "Tỷ Trọng": {"number": allocation},
+                    "% Lời/Lỗ CP": {"number": holding_pnl}
                 }
             }
             notion_request("pages", "POST", payload)
-            print(f"   ✅ [GHI] {title}")
+            print(f"   ✅ [GHI] {title} | Alloc: {allocation:.0%} | PnL: {holding_pnl:.2%}")
             existing.add(time_sig)
             new_logs_count += 1
 
