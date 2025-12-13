@@ -15,9 +15,9 @@ LOG_DB_ID    = os.environ.get("LOG_DB_ID")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# [NEW] CẤU HÌNH QUẢN TRỊ RỦI RO (BẠN CÓ THỂ SỬA Ở ĐÂY)
-STOP_LOSS_PCT = -0.07   # Cắt lỗ nếu lỗ -7%
-TAKE_PROFIT_PCT = 0.15  # Chốt lời nếu lãi +15%
+# CẤU HÌNH RISK MANAGEMENT
+STOP_LOSS_PCT = -0.07   # Cắt lỗ -7%
+TAKE_PROFIT_PCT = 0.15  # Chốt lời +15%
 
 if not NOTION_TOKEN or not CONFIG_DB_ID or not LOG_DB_ID:
     print("❌ LỖI: Thiếu Notion Secrets.")
@@ -39,7 +39,7 @@ G1-B14,Vận khí tốt, có thể mua vào tích lũy.
 G23-B4,Mông lung xấu, nên hạ tỷ trọng bán bớt.
 """
 
-# --- 3. THƯ VIỆN & TELEGRAM ---
+# --- 3. THƯ VIỆN ---
 try:
     import ccxt
     from lunardate import LunarDate
@@ -59,7 +59,7 @@ def send_telegram_message(message):
 def get_stock_data(symbol):
     try:
         to_ts = int(time.time())
-        from_ts = to_ts - (5 * 24 * 3600)
+        from_ts = to_ts - (10 * 24 * 3600) # Lấy 10 ngày để đủ dữ liệu tính RSI/SMA
         url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
         headers = {'User-Agent': 'Mozilla/5.0'}
         res = requests.get(url, headers=headers).json()
@@ -72,6 +72,26 @@ def get_stock_data(symbol):
                 })
         return data
     except: return []
+
+# --- [NEW] HÀM PHÂN TÍCH KỸ THUẬT (V1.3) ---
+def add_technical_indicators(data):
+    if not data: return []
+    df = pd.DataFrame(data)
+    
+    # 1. Tính SMA 20 (Simple Moving Average)
+    df['SMA20'] = df['p'].rolling(window=20).mean()
+    
+    # 2. Tính RSI 14 (Relative Strength Index)
+    delta = df['p'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # Fill NaN bằng 0 hoặc giá trị đầu tiên để không lỗi
+    df = df.fillna(0)
+    
+    return df.to_dict('records')
 
 # --- 5. NOTION ---
 def notion_request(endpoint, method="POST", payload=None):
@@ -137,7 +157,7 @@ def get_existing_signatures(symbol):
             except: pass
     return s
 
-# --- 7. RUN CAMPAIGN (V1.2 - DEFENSE SHIELD) ---
+# --- 7. RUN CAMPAIGN (V1.3 - TECHNICAL FILTER) ---
 def run_campaign(config):
     try:
         name = config['properties']['Tên Chiến Dịch']['title'][0]['plain_text']
@@ -148,19 +168,25 @@ def run_campaign(config):
 
     print(f"\n🚀 Processing: {name} ({symbol})")
     
-    data = []
+    data_raw = []
     if "Binance" in market or "Crypto" in market:
         try:
             xc = ccxt.kucoin()
-            ohlcv = xc.fetch_ohlcv(symbol, '1h', limit=48)
-            for c in ohlcv: data.append({"t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))), "p": c[4]})
+            ohlcv = xc.fetch_ohlcv(symbol, '1h', limit=200) # Lấy nhiều nến hơn để tính chỉ báo
+            for c in ohlcv: data_raw.append({"t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))), "p": c[4]})
         except: pass
     elif "Stock" in market or "VNIndex" in market:
-        data = get_stock_data(symbol)
+        data_raw = get_stock_data(symbol)
 
-    if not data:
+    if not data_raw:
         print("   -> ❌ Không có dữ liệu giá.")
         return
+
+    # [NEW] TÍNH TOÁN KỸ THUẬT
+    data = add_technical_indicators(data_raw)
+    
+    # Chỉ lấy 48 nến cuối để trade (để khớp với logic cũ)
+    data_to_trade = data[-48:] 
 
     df_adv = load_advice_data()
     adv_map = dict(zip(df_adv['KEY_ID'], df_adv['Lời Khuyên']))
@@ -169,60 +195,77 @@ def run_campaign(config):
     cash, stock, equity, avg_price = capital, 0, capital, 0
     new_logs_count = 0
 
-    for item in data:
+    for item in data_to_trade:
         dt, price = item['t'], item['p']
+        # Lấy chỉ báo kỹ thuật
+        sma20 = item.get('SMA20', 0)
+        rsi = item.get('RSI', 50) # Mặc định 50 nếu chưa tính được
+        
         time_sig = dt.strftime('%H:%M %d/%m')
         
-        # 1. Tính toán PnL hiện tại (trước khi ra quyết định)
+        # 1. PnL Check
         holding_pnl = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
-        # 2. Logic Kinh Dịch (Cơ bản)
+        # 2. Kinh Dịch Signal
         key = calculate_hexagram(dt)
         advice = adv_map.get(key, "")
         action, percent = analyze_smart_action(advice)
         
         qty, note, display_label = 0, "", "GIỮ"
+        risk_reason = ""
 
-        # 3. [NEW] LỚP PHÒNG THỦ (Risk Management Layer)
+        # 3. Risk Management Layer
         risk_action = None
-        if stock > 0: # Chỉ check khi đang có hàng
-            if holding_pnl <= STOP_LOSS_PCT:
-                risk_action = "STOP_LOSS"
-            elif holding_pnl >= TAKE_PROFIT_PCT:
-                risk_action = "TAKE_PROFIT"
+        if stock > 0:
+            if holding_pnl <= STOP_LOSS_PCT: risk_action = "STOP_LOSS"
+            elif holding_pnl >= TAKE_PROFIT_PCT: risk_action = "TAKE_PROFIT"
 
-        # 4. QUYẾT ĐỊNH CUỐI CÙNG (Ưu tiên Phòng thủ -> rồi mới đến Kinh Dịch)
+        # 4. [NEW] TECHNICAL FILTER LAYER (Bộ lọc kỹ thuật)
+        # Chỉ áp dụng lọc khi Kinh Dịch bảo MUA (Để tránh mua sai)
+        # Không lọc khi BÁN (để ưu tiên thoát hàng nhanh)
+        
+        tech_status = "OK"
+        if action == "MUA":
+            # Điều kiện mua: (Xu hướng Tăng) HOẶC (Bắt đáy RSI thấp)
+            # Không mua nếu: Giá nằm dưới SMA20 VÀ RSI > 30 (Downtrend và chưa quá bán)
+            if price < sma20 and rsi > 35:
+                # Kèo này rủi ro -> HỦY MUA
+                action = "GIỮ"
+                tech_status = "BAD_TECH" # Đánh dấu do kỹ thuật xấu
+                risk_reason = f"(⛔ Giá < SMA20 & RSI={rsi:.0f})"
+
+            # Tránh mua đỉnh: RSI > 75
+            if rsi > 75:
+                action = "GIỮ"
+                tech_status = "OVERBOUGHT"
+                risk_reason = f"(⛔ RSI={rsi:.0f} Quá mua)"
+
+        # 5. FINAL DECISION
         final_action = action
         final_percent = percent
 
         if risk_action == "STOP_LOSS":
-            final_action = "BÁN"
-            final_percent = 1.0 # Bán hết sạch
-            advice = f"⚠️ CẮT LỖ KHẨN CẤP (Lỗ {holding_pnl:.1%})" # Ghi đè lời khuyên
+            final_action = "BÁN"; final_percent = 1.0; risk_reason = f"⚠️ CẮT LỖ (Lỗ {holding_pnl:.1%})"
         elif risk_action == "TAKE_PROFIT":
-            final_action = "BÁN"
-            final_percent = 0.5 # Bán 50%
-            advice = f"💰 CHỐT LỜI BẢO TOÀN (Lãi {holding_pnl:.1%})"
+            final_action = "BÁN"; final_percent = 0.5; risk_reason = f"💰 CHỐT LỜI (Lãi {holding_pnl:.1%})"
+        elif tech_status != "OK" and display_label == "MUA":
+             display_label = "✋ ĐỢI (TECH XẤU)" # Hiển thị trạng thái chờ
 
-        # 5. KHỚP LỆNH
+        # 6. EXECUTION
         if final_action == "MUA":
-            # (Không mua thêm nếu đang lỗ nặng - Logic an toàn phụ)
-            if holding_pnl < -0.05 and stock > 0:
-                display_label = "✊ GIỮ (LỖ > 5% - KHÔNG TBC)"
-            else:
-                amount_to_spend = cash * final_percent
-                if amount_to_spend > 1:
-                    qty = amount_to_spend / price
-                    if "Stock" in market or "VNIndex" in market: qty = int(qty // 100) * 100
-                    if qty > 0:
-                        new_value = qty * price
-                        current_val = stock * avg_price
-                        stock += qty
-                        avg_price = (current_val + new_value) / stock
-                        cash -= qty * price
-                        note = f"MUA {int(final_percent*100)}%"
-                        display_label = "MUA"
-                if display_label != "MUA" and stock > 0: display_label = "✊ GIỮ"
+            amount_to_spend = cash * final_percent
+            if amount_to_spend > 1:
+                qty = amount_to_spend / price
+                if "Stock" in market or "VNIndex" in market: qty = int(qty // 100) * 100
+                if qty > 0:
+                    new_value = qty * price
+                    current_val = stock * avg_price
+                    stock += qty
+                    avg_price = (current_val + new_value) / stock
+                    cash -= qty * price
+                    note = f"MUA {int(final_percent*100)}%"
+                    display_label = "MUA"
+            if display_label != "MUA" and stock > 0: display_label = "✊ GIỮ"
 
         elif final_action == "BÁN":
             qty_to_sell = stock * final_percent
@@ -234,35 +277,33 @@ def run_campaign(config):
                 cash += qty_to_sell * price
                 note = f"BÁN {int(final_percent*100)}%"
                 
-                # Đổi nhãn nếu là lệnh của Risk Management
                 if risk_action == "STOP_LOSS": display_label = "✂️ CẮT LỖ"
                 elif risk_action == "TAKE_PROFIT": display_label = "💵 CHỐT LỜI"
                 else: display_label = "BÁN"
-
                 if stock == 0: avg_price = 0
             if display_label not in ["BÁN", "✂️ CẮT LỖ", "💵 CHỐT LỜI"] and stock == 0: display_label = "⛔ KHÔNG MUA"
         else:
             if stock > 0: display_label = "✊ GIỮ"
             else: display_label = "⛔ KHÔNG MUA"
 
-        # Tính toán lại chỉ số sau khớp lệnh
         current_asset_val = stock * price
         equity = cash + current_asset_val
         roi_total = (equity - capital) / capital
         allocation = current_asset_val / equity if equity > 0 else 0
-        # PnL sau lệnh (nếu còn hàng)
         holding_pnl_new = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
-        # GHI VÀO NOTION
+        # GHI LOG
         if time_sig not in existing:
             icon = "⚪"
             if "MUA" in display_label: icon = "🟢"
             if "BÁN" in display_label: icon = "🔴"
-            if "CẮT LỖ" in display_label: icon = "⚠️" # Icon mới
-            if "CHỐT LỜI" in display_label: icon = "💰" # Icon mới
+            if "CẮT LỖ" in display_label: icon = "⚠️"
+            if "CHỐT LỜI" in display_label: icon = "💰"
             if "GIỮ" in display_label: icon = "✊"
             if "KHÔNG MUA" in display_label: icon = "⛔"
 
+            # Thêm thông tin kỹ thuật vào Title để dễ check
+            tech_info = f" | RSI:{rsi:.0f}"
             title = f"{icon} {display_label} | {time_sig}"
             
             payload = {
@@ -282,19 +323,20 @@ def run_campaign(config):
                 }
             }
             notion_request("pages", "POST", payload)
-            print(f"   ✅ [GHI] {title}")
+            print(f"   ✅ [GHI] {title} {risk_reason}")
             existing.add(time_sig)
             new_logs_count += 1
             
-            # GỬI TELEGRAM (Chỉ Mua/Bán/Cắt Lỗ/Chốt Lời)
+            # GỬI TELEGRAM
             if any(x in display_label for x in ["MUA", "BÁN", "CẮT LỖ", "CHỐT LỜI"]):
+                msg_reason = risk_reason if risk_reason else advice
                 msg = (
                     f"🔔 <b>TÍN HIỆU: {symbol}</b>\n"
                     f"{icon} <b>Lệnh:</b> {display_label}\n"
-                    f"⏰ <b>Thời gian:</b> {time_sig}\n"
+                    f"⏰ <b>Time:</b> {time_sig}\n"
                     f"💵 <b>Giá:</b> {price:,.2f}\n"
-                    f"📈 <b>Hiệu suất lệnh:</b> {holding_pnl:.1%} (Trước khi bán)\n"
-                    f"💡 <b>Lý do:</b> {advice}"
+                    f"📊 <b>RSI:</b> {rsi:.0f} | <b>SMA20:</b> {sma20:,.0f}\n"
+                    f"💡 <b>Lý do:</b> {msg_reason}"
                 )
                 send_telegram_message(msg)
 
@@ -308,8 +350,6 @@ res = notion_request(f"databases/{CONFIG_DB_ID}/query", "POST", query)
 
 if res and 'results' in res:
     print(f"✅ Tìm thấy {len(res['results'])} chiến dịch.")
-    # Chỉ gửi tin nhắn start 1 lần để tránh spam
-    # send_telegram_message(f"🤖 Bot V1.2 (Defense) đã chạy.") 
     for cfg in res['results']: run_campaign(cfg)
 else:
     print("❌ Lỗi kết nối Notion.")
