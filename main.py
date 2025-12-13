@@ -51,7 +51,6 @@ def send_telegram_message(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        # [FIX 1] Đổi parse_mode thành HTML để hiểu thẻ <b>
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
         requests.post(url, json=payload, timeout=10)
     except: pass
@@ -60,7 +59,6 @@ def send_telegram_message(message):
 def get_stock_data(symbol):
     try:
         to_ts = int(time.time())
-        # [FIX 2] Lấy dữ liệu 30 ngày để đủ nến tính chỉ báo cho cả quá khứ
         from_ts = to_ts - (30 * 24 * 3600) 
         url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
         headers = {'User-Agent': 'Mozilla/5.0'}
@@ -75,21 +73,16 @@ def get_stock_data(symbol):
         return data
     except: return []
 
-# --- 5. HÀM PHÂN TÍCH KỸ THUẬT ---
+# --- 5. TECHNICAL INDICATORS ---
 def add_technical_indicators(data):
     if not data: return []
     df = pd.DataFrame(data)
-    
-    # Tính SMA 20
     df['SMA20'] = df['p'].rolling(window=20).mean()
-    
-    # Tính RSI 14
     delta = df['p'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
-    
     df = df.fillna(0)
     return df.to_dict('records')
 
@@ -103,7 +96,7 @@ def notion_request(endpoint, method="POST", payload=None):
         return response.json() if response.status_code == 200 else None
     except: return None
 
-# --- 7. CORE LOGIC ---
+# --- 7. CORE LOGIC (V1.4 - NLP FIX) ---
 def load_advice_data():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(current_dir, 'data_loi_khuyen.csv')
@@ -128,17 +121,34 @@ def calculate_hexagram(dt):
     new_thuong, new_ha = (new_trig, thuong) if is_upper else (thuong, new_trig)
     return f"G{id_goc}-B{king_wen_matrix[new_thuong-1][new_ha-1]}"
 
+# [QUAN TRỌNG] HÀM PHÂN TÍCH TỪ KHÓA ĐÃ ĐƯỢC NÂNG CẤP
 def analyze_smart_action(text):
-    if not isinstance(text, str): return "GIỮ", 0.0
+    if not isinstance(text, str) or not text: 
+        return "GIỮ", 0.0
+    
     text = text.lower()
+    
+    # 1. BỘ LỌC TỪ CHỐI (Negative Filter) - Ưu tiên cao nhất
+    # Nếu gặp các từ này, lập tức chặn lệnh mua bất kể có từ "mua" hay không
+    avoid_keywords = ['đứng ngoài', 'quan sát', 'không nên mua', 'rút lui', 'chờ đợi', 'thận trọng', 'đừng mua', 'rủi ro', 'lo sợ']
+    if any(w in text for w in avoid_keywords):
+        return "GIỮ", 0.0
+
+    # 2. BỘ LỌC MUA MẠNH
     strong_buy = ['đại cát', 'lợi lớn', 'bay cao', 'thời cơ vàng', 'mua ngay', 'tất tay', 'all-in']
-    strong_sell = ['nguy hiểm', 'sập', 'tháo chạy', 'bán tháo', 'tuyệt vọng', 'cắt lỗ ngay']
     if any(w in text for w in strong_buy): return "MUA", 1.0 
+
+    # 3. BỘ LỌC BÁN MẠNH
+    strong_sell = ['nguy hiểm', 'sập', 'tháo chạy', 'bán tháo', 'tuyệt vọng', 'cắt lỗ ngay']
     if any(w in text for w in strong_sell): return "BÁN", 1.0
+
+    # 4. BỘ LỌC TRUNG TÍNH
     normal_buy = ['mua', 'tốt', 'lãi', 'tích lũy', 'hanh thông', 'tăng', 'nên mua']
     normal_sell = ['bán', 'xấu', 'lỗ', 'giảm', 'trở ngại', 'hạ tỷ trọng', 'nên bán']
+
     if any(w in text for w in normal_buy): return "MUA", 0.5
     if any(w in text for w in normal_sell): return "BÁN", 0.5
+
     return "GIỮ", 0.0
 
 def get_existing_signatures(symbol):
@@ -168,12 +178,11 @@ def run_campaign(config):
 
     print(f"\n🚀 Processing: {name} ({symbol})")
     
-    # 1. Lấy dữ liệu thô (nhiều hơn cần thiết để tính chỉ báo)
     data_raw = []
     if "Binance" in market or "Crypto" in market:
         try:
             xc = ccxt.kucoin()
-            ohlcv = xc.fetch_ohlcv(symbol, '1h', limit=500) # Lấy 500 nến
+            ohlcv = xc.fetch_ohlcv(symbol, '1h', limit=500)
             for c in ohlcv: data_raw.append({"t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))), "p": c[4]})
         except: pass
     elif "Stock" in market or "VNIndex" in market:
@@ -183,11 +192,7 @@ def run_campaign(config):
         print("   -> ❌ Không có dữ liệu giá.")
         return
 
-    # 2. Tính toán kỹ thuật (trên toàn bộ dữ liệu)
     data_full = add_technical_indicators(data_raw)
-    
-    # 3. Cắt lấy 48 nến cuối cùng để xử lý giao dịch
-    # (Lúc này các nến cuối đã có RSI/SMA đầy đủ từ quá khứ)
     data_to_trade = data_full[-48:] 
 
     df_adv = load_advice_data()
@@ -203,11 +208,15 @@ def run_campaign(config):
         rsi = item.get('RSI', 0)
         
         time_sig = dt.strftime('%H:%M %d/%m')
-        
         holding_pnl = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
         key = calculate_hexagram(dt)
         advice = adv_map.get(key, "")
+        
+        # [FIX] Nếu không có lời khuyên, điền mặc định
+        if not advice:
+            advice = f"Chưa có lời khuyên cho quẻ {key}"
+            
         action, percent = analyze_smart_action(advice)
         
         qty, note, display_label = 0, "", "GIỮ"
@@ -222,12 +231,10 @@ def run_campaign(config):
         # TECHNICAL FILTER
         tech_status = "OK"
         if action == "MUA":
-            # Chỉ lọc mua: Giá < SMA20 VÀ RSI > 35 (Chưa quá bán) -> Rủi ro
             if price < sma20 and rsi > 35:
                 action = "GIỮ"
                 tech_status = "BAD_TECH"
                 risk_reason = f"(⛔ Giá < SMA20 & RSI={rsi:.0f})"
-
             if rsi > 75:
                 action = "GIỮ"
                 tech_status = "OVERBOUGHT"
