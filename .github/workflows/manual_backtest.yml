@@ -1,0 +1,23 @@
+name: Manual Backtest
+
+on:
+  workflow_dispatch: # Cho phép bấm nút chạy bằng tay
+
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install pandas requests lunardate
+
+      - name: Run Backtest Script
+        run: python backtest.py
