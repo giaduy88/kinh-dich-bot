@@ -1,54 +1,65 @@
 import time
 import pandas as pd
 import requests
-import math
+import re
+import os
+import io
 from datetime import datetime, timezone, timedelta
 
-# --- CẤU HÌNH KIỂM THỬ ---
-SYMBOL = "HPG"       # Mã muốn test
-CAPITAL = 100000000  # Vốn giả lập (100 triệu)
-DAYS_BACK = 180      # Test dữ liệu 6 tháng gần nhất
-MARKET_TYPE = "Stock" # "Stock" hoặc "Crypto"
-
-# CẤU HÌNH LOGIC (GIỐNG V1.4)
-STOP_LOSS_PCT = -0.07
-TAKE_PROFIT_PCT = 0.15
+# --- CẤU HÌNH MẶC ĐỊNH ---
+# (Các giá trị này sẽ bị ghi đè khi gọi từ Telegram)
+DEFAULT_SYMBOL = "HPG"
+DEFAULT_DAYS = 180
 
 # --- THƯ VIỆN ---
 try:
+    import ccxt
     from lunardate import LunarDate
 except ImportError:
-    print("Cần cài thư viện lunardate")
     pass
 
-# --- 1. DATA FETCHING ---
+# --- HÀM TẢI DỮ LIỆU ---
 def get_historical_data(symbol, days):
-    print(f"⏳ Đang tải dữ liệu {symbol} trong {days} ngày qua...")
     to_ts = int(time.time())
     from_ts = to_ts - (days * 24 * 3600)
     
-    # API DNSE cho chứng khoán
-    if MARKET_TYPE == "Stock":
-        url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
+    # Tự động nhận diện Crypto (có chứa USDT hoặc ký tự /)
+    is_crypto = "USDT" in symbol.upper() or "/" in symbol
+    
+    data = []
+    if is_crypto:
         try:
+            # Dùng CCXT lấy dữ liệu Crypto
+            symbol_map = symbol.upper().replace("USDT", "/USDT") if "/" not in symbol else symbol
+            ex = ccxt.binance() # Hoặc kucoin
+            # Lấy nến 1h. Limit tối đa của API thường là 500-1000 nến
+            ohlcv = ex.fetch_ohlcv(symbol_map, '1h', limit=min(days*24, 1000))
+            for c in ohlcv:
+                data.append({
+                    "t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))),
+                    "p": float(c[4])
+                })
+        except Exception as e:
+            return [], f"Lỗi Crypto: {str(e)}"
+    else:
+        # Dùng API DNSE cho Stock
+        try:
+            url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
             res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).json()
-            data = []
             if 't' in res and res['t']:
                 for i in range(len(res['t'])):
                     data.append({
                         "t": datetime.fromtimestamp(res['t'][i], tz=timezone(timedelta(hours=7))),
                         "p": float(res['c'][i])
                     })
-            return data
-        except: return []
-    
-    # API Kucoin cho Crypto
-    else:
-        # (Demo đơn giản cho Crypto - cần ccxt nếu muốn đầy đủ hơn)
-        return []
+        except Exception as e:
+            return [], f"Lỗi Stock: {str(e)}"
+            
+    return data, "OK"
 
-# --- 2. LOGIC BỔ TRỢ ---
+# --- CÁC HÀM LOGIC (Dùng chung logic với main.py) ---
 def add_indicators(df):
+    if df.empty: return df
     df['SMA20'] = df['p'].rolling(window=20).mean()
     delta = df['p'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
@@ -57,6 +68,7 @@ def add_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df.fillna(0)
 
+# Ma trận King Wen (Kinh Dịch)
 king_wen_matrix = [[1, 10, 13, 25, 44, 6, 33, 12], [43, 58, 49, 17, 28, 47, 31, 45], [14, 38, 30, 21, 50, 64, 56, 35], [34, 54, 55, 51, 32, 40, 62, 16], [9, 61, 37, 42, 57, 59, 53, 20], [5, 60, 63, 3, 48, 29, 39, 8], [26, 41, 22, 27, 18, 4, 52, 23], [11, 19, 36, 24, 46, 7, 15, 2]]
 
 def calculate_hexagram(dt):
@@ -75,142 +87,133 @@ def calculate_hexagram(dt):
     new_thuong, new_ha = (new_trig, thuong) if is_upper else (thuong, new_trig)
     return f"G{id_goc}-B{king_wen_matrix[new_thuong-1][new_ha-1]}"
 
-# --- 3. GIẢ LẬP LỜI KHUYÊN (MOCK DATA) ---
-# Vì backtest không gọi file CSV thật, ta dùng hàm Hash để giả lập ngẫu nhiên "tính tốt xấu" của quẻ
-# giúp test logic đi tiền. (Thực tế cần file CSV đầy đủ)
-def mock_smart_action(key):
-    # Giả lập: Quẻ có ID chẵn là Tốt, Lẻ là Xấu (Để test cơ chế)
-    # Trong thực tế: Bạn cần load file data_loi_khuyen.csv vào đây
-    num = int(key.split('-')[0][1:]) 
-    if num % 5 == 0: return "MUA", 1.0 # Đại cát
-    if num % 3 == 0: return "MUA", 0.5 # Tốt
-    if num % 7 == 0: return "BÁN", 1.0 # Xấu
+def analyze_smart_action(text):
+    if not isinstance(text, str) or not text: return "GIỮ", 0.0
+    text = text.lower()
+    avoid = ['đứng ngoài', 'quan sát', 'không nên mua', 'rút lui', 'chờ đợi', 'thận trọng']
+    if any(w in text for w in avoid): return "GIỮ", 0.0
+    strong_buy = ['đại cát', 'lợi lớn', 'bay cao', 'thời cơ vàng', 'mua ngay', 'tất tay', 'all-in']
+    if any(w in text for w in strong_buy): return "MUA", 1.0 
+    strong_sell = ['nguy hiểm', 'sập', 'tháo chạy', 'bán tháo', 'tuyệt vọng', 'cắt lỗ ngay']
+    if any(w in text for w in strong_sell): return "BÁN", 1.0
+    normal_buy = ['mua', 'tốt', 'lãi', 'tích lũy', 'hanh thông', 'tăng', 'nên mua']
+    if any(w in text for w in normal_buy): return "MUA", 0.5
+    normal_sell = ['bán', 'xấu', 'lỗ', 'giảm', 'trở ngại', 'hạ tỷ trọng', 'nên bán']
+    if any(w in text for w in normal_sell): return "BÁN", 0.5
     return "GIỮ", 0.0
 
-# --- 4. ENGINE BACKTEST ---
-def run_backtest():
-    raw_data = get_historical_data(SYMBOL, DAYS_BACK)
+# --- CORE BACKTEST FUNCTION (Được gọi từ main.py) ---
+def run_backtest_core(symbol, days, advice_map):
+    raw_data, msg = get_historical_data(symbol, days)
     if not raw_data:
-        print("❌ Không lấy được dữ liệu.")
-        return
+        return f"❌ Lỗi tải dữ liệu {symbol}: {msg}"
 
     df = pd.DataFrame(raw_data)
     df = add_indicators(df)
     data = df.to_dict('records')
+    
+    if len(data) < 20:
+        return f"⚠️ Dữ liệu quá ít ({len(data)} nến) để backtest."
 
-    print(f"✅ Đã tải {len(data)} nến. Bắt đầu chạy giả lập...")
+    # Init Portfolio
+    capital = 100_000_000
+    cash, stock, avg_price = capital, 0, 0
+    trade_count, win_count, loss_count = 0, 0, 0
+    stop_loss_pct, take_profit_pct = -0.07, 0.15
     
-    cash = CAPITAL
-    stock = 0
-    avg_price = 0
-    
-    trade_count = 0
-    win_count = 0
-    loss_count = 0
-    
-    history = []
+    history_log = []
 
     for item in data:
         dt, price = item['t'], item['p']
-        sma20 = item['SMA20']
-        rsi = item['RSI']
+        sma20, rsi = item.get('SMA20', 0), item.get('RSI', 50)
         
         # PnL Check
         holding_pnl = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
         # Logic Kinh Dịch
         key = calculate_hexagram(dt)
-        action, percent = mock_smart_action(key) # Dùng Mock hoặc Load CSV thật
+        advice = advice_map.get(key, "")
+        action, percent = analyze_smart_action(advice)
         
-        display_label = "GIỮ"
-
-        # RISK MANAGEMENT
+        # Risk Management
         risk_action = None
         if stock > 0:
-            if holding_pnl <= STOP_LOSS_PCT: risk_action = "STOP_LOSS"
-            elif holding_pnl >= TAKE_PROFIT_PCT: risk_action = "TAKE_PROFIT"
+            if holding_pnl <= stop_loss_pct: risk_action = "STOP_LOSS"
+            elif holding_pnl >= take_profit_pct: risk_action = "TAKE_PROFIT"
 
-        # TECHNICAL FILTER
+        # Technical Filter
         if action == "MUA":
             if price < sma20 and rsi > 35: action = "GIỮ"
             if rsi > 75: action = "GIỮ"
 
-        # FINAL DECISION
-        final_action = action
-        final_percent = percent
+        # Final Decision
+        final_action, final_percent = action, percent
+        if risk_action == "STOP_LOSS": final_action, final_percent = "BÁN", 1.0
+        elif risk_action == "TAKE_PROFIT": final_action, final_percent = "BÁN", 0.5
 
-        if risk_action == "STOP_LOSS":
-            final_action = "BÁN"; final_percent = 1.0
-        elif risk_action == "TAKE_PROFIT":
-            final_action = "BÁN"; final_percent = 0.5
-
-        # EXECUTION SIMULATION
+        # Execution
         executed = False
         pnl_realized = 0
+        type_str = ""
 
         if final_action == "MUA":
             amt = cash * final_percent
-            if amt > 10000:
-                qty = int(amt / price)
+            if amt > 50000: # Min order
+                qty = amt / price
+                # Làm tròn cổ phiếu (lô 100) nếu không phải Crypto
+                if "USDT" not in symbol.upper() and "/" not in symbol:
+                    qty = int(qty // 100) * 100
+                
                 if qty > 0:
                     current_val = stock * avg_price
                     new_val = qty * price
                     stock += qty
                     avg_price = (current_val + new_val) / stock
                     cash -= qty * price
-                    display_label = "MUA"
                     executed = True
+                    type_str = "MUA"
 
         elif final_action == "BÁN":
-            qty = int(stock * final_percent)
+            qty = stock * final_percent
+            if "USDT" not in symbol.upper() and "/" not in symbol:
+                qty = int(qty // 100) * 100
+                if qty > stock: qty = stock
+            
             if qty > 0:
                 stock -= qty
                 cash += qty * price
-                display_label = "BÁN"
-                if risk_action: display_label = risk_action
-                
-                # Tính lãi lỗ thực hiện
-                pnl_realized = (price - avg_price) * qty
-                if pnl_realized > 0: win_count += 1
-                elif pnl_realized < 0: loss_count += 1
-                trade_count += 1
                 executed = True
+                type_str = risk_action if risk_action else "BÁN"
+                
+                # Check Win/Loss
+                trade_pnl = (price - avg_price) * qty
+                if trade_pnl > 0: win_count += 1
+                elif trade_pnl < 0: loss_count += 1
+                trade_count += 1
                 
                 if stock == 0: avg_price = 0
 
-        # Ghi log nếu có giao dịch
-        if executed:
-            total_equity = cash + (stock * price)
-            history.append({
-                "Time": dt.strftime('%d/%m %H:%M'),
-                "Action": display_label,
-                "Price": price,
-                "Equity": total_equity,
-                "PnL": pnl_realized
-            })
-
-    # --- 5. BÁO CÁO KẾT QUẢ ---
+    # Summary
     final_equity = cash + (stock * data[-1]['p'])
-    roi = (final_equity - CAPITAL) / CAPITAL
+    roi = (final_equity - capital) / capital
+    win_rate = (win_count / trade_count) if trade_count > 0 else 0
     
-    print("\n" + "="*40)
-    print(f"📊 KẾT QUẢ BACKTEST ({SYMBOL} - {DAYS_BACK} ngày)")
-    print("="*40)
-    print(f"💰 Vốn ban đầu:   {CAPITAL:,.0f} đ")
-    print(f"💎 Vốn cuối cùng: {final_equity:,.0f} đ")
-    print(f"🚀 Lợi nhuận:     {final_equity - CAPITAL:,.0f} đ")
-    print(f"📈 ROI:           {roi:.2%}")
-    print(f"----------------------------------------")
-    print(f"🛒 Tổng lệnh bán: {trade_count}")
-    print(f"✅ Số lệnh thắng: {win_count}")
-    print(f"❌ Số lệnh thua:  {loss_count}")
-    print(f"🎯 Win Rate:      {win_count/trade_count:.1%}" if trade_count > 0 else "🎯 Win Rate: 0%")
-    print("="*40)
-    
-    # In 5 giao dịch gần nhất
-    print("\n📝 5 Giao dịch gần nhất:")
-    for h in history[-5:]:
-        print(f"{h['Time']} | {h['Action']:<10} | Giá: {h['Price']:,.0f} | Tài sản: {h['Equity']:,.0f}")
+    report = (
+        f"📊 <b>KẾT QUẢ BACKTEST: {symbol}</b>\n"
+        f"⏳ Thời gian: {days} ngày qua\n"
+        f"🕯 Số nến: {len(data)}\n"
+        f"--------------------------\n"
+        f"💰 Vốn đầu: {capital/1e6:.0f} tr\n"
+        f"💎 Vốn cuối: {final_equity/1e6:.1f} tr\n"
+        f"🚀 <b>ROI: {roi:+.2%}</b>\n"
+        f"--------------------------\n"
+        f"🛒 Tổng lệnh: {trade_count}\n"
+        f"✅ Thắng: {win_count} | ❌ Thua: {loss_count}\n"
+        f"🎯 Win Rate: {win_rate:.1%}"
+    )
+    return report
 
+# --- MAIN BLOCK (Để test offline) ---
 if __name__ == "__main__":
-    run_backtest()
+    # Mock data để test file này chạy độc lập
+    print(run_backtest_core("HPG", 180, {}))
