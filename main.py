@@ -12,10 +12,16 @@ from datetime import datetime, timezone, timedelta
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 CONFIG_DB_ID = os.environ.get("CONFIG_DB_ID")
 LOG_DB_ID    = os.environ.get("LOG_DB_ID")
+# [NEW] Cấu hình Telegram
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 if not NOTION_TOKEN or not CONFIG_DB_ID or not LOG_DB_ID:
-    print("❌ LỖI: Thiếu Secrets.")
+    print("❌ LỖI: Thiếu Notion Secrets.")
     sys.exit(1)
+
+if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+    print("⚠️ CẢNH BÁO: Thiếu Telegram Secrets. Bot sẽ chạy nhưng không gửi tin nhắn.")
 
 def extract_id(text):
     if not text: return ""
@@ -41,7 +47,23 @@ except ImportError: pass
 import ccxt
 from lunardate import LunarDate
 
-# --- 4. HÀM API CHỨNG KHOÁN (DNSE) ---
+# --- [NEW] HÀM GỬI TELEGRAM ---
+def send_telegram_message(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message,
+            "parse_mode": "Markdown" # Để in đậm/nghiêng cho đẹp
+        }
+        requests.post(url, json=payload, timeout=10)
+    except Exception as e:
+        print(f"❌ Lỗi gửi Telegram: {e}")
+
+# --- 4. HÀM API CHỨNG KHOÁN ---
 def get_stock_data(symbol):
     try:
         to_ts = int(time.time())
@@ -71,12 +93,11 @@ def notion_request(endpoint, method="POST", payload=None):
         return response.json() if response.status_code == 200 else None
     except: return None
 
-# --- 6. HÀM LOAD FILE ---
+# --- 6. LOAD FILE ---
 def load_advice_data():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(current_dir, 'data_loi_khuyen.csv')
-    if os.path.exists(file_path):
-        return pd.read_csv(file_path)
+    if os.path.exists(file_path): return pd.read_csv(file_path)
     return pd.read_csv(io.StringIO(BACKUP_CSV))
 
 # --- 7. LOGIC KINH DỊCH ---
@@ -101,34 +122,23 @@ def calculate_hexagram(dt):
 def analyze_smart_action(text):
     if not isinstance(text, str): return "GIỮ", 0.0
     text = text.lower()
-    
     strong_buy = ['đại cát', 'lợi lớn', 'bay cao', 'thời cơ vàng', 'mua ngay', 'tất tay', 'all-in']
     strong_sell = ['nguy hiểm', 'sập', 'tháo chạy', 'bán tháo', 'tuyệt vọng', 'cắt lỗ ngay']
-    
     if any(w in text for w in strong_buy): return "MUA", 1.0 
     if any(w in text for w in strong_sell): return "BÁN", 1.0
-
     normal_buy = ['mua', 'tốt', 'lãi', 'tích lũy', 'hanh thông', 'tăng', 'nên mua']
     normal_sell = ['bán', 'xấu', 'lỗ', 'giảm', 'trở ngại', 'hạ tỷ trọng', 'nên bán']
-
     if any(w in text for w in normal_buy): return "MUA", 0.5
     if any(w in text for w in normal_sell): return "BÁN", 0.5
-
     return "GIỮ", 0.0
 
 # --- 8. KIỂM TRA LỊCH SỬ ---
 def get_existing_signatures(symbol):
-    payload = {
-        "filter": {"property": "Mã", "rich_text": {"contains": symbol}},
-        "sorts": [{"property": "Giờ Giao Dịch", "direction": "descending"}],
-        "page_size": 100 
-    }
-    try:
-        data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
-    except:
+    payload = {"filter": {"property": "Mã", "rich_text": {"contains": symbol}}, "sorts": [{"property": "Giờ Giao Dịch", "direction": "descending"}], "page_size": 100}
+    try: data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
+    except: 
         payload["sorts"] = [{"property": "Thời Gian", "direction": "descending"}]
         data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
-
     s = set()
     if data and 'results' in data:
         for p in data['results']:
@@ -139,7 +149,7 @@ def get_existing_signatures(symbol):
             except: pass
     return s
 
-# --- 9. HÀM CHẠY CHIẾN DỊCH (V29) ---
+# --- 9. HÀM CHẠY CHIẾN DỊCH (V1.1) ---
 def run_campaign(config):
     try:
         name = config['properties']['Tên Chiến Dịch']['title'][0]['plain_text']
@@ -150,6 +160,7 @@ def run_campaign(config):
 
     print(f"\n🚀 Processing: {name} ({symbol})")
     
+    # Lấy Data
     data = []
     if "Binance" in market or "Crypto" in market:
         try:
@@ -166,15 +177,10 @@ def run_campaign(config):
 
     df_adv = load_advice_data()
     adv_map = dict(zip(df_adv['KEY_ID'], df_adv['Lời Khuyên']))
-
     existing = get_existing_signatures(symbol)
     
-    # KHỞI TẠO TÀI KHOẢN GIẢ LẬP
-    cash = capital
-    stock = 0
-    equity = capital
-    avg_price = 0 # Giá vốn trung bình
-    
+    # Portfolio Init
+    cash, stock, equity, avg_price = capital, 0, capital, 0
     new_logs_count = 0
 
     for item in data:
@@ -183,31 +189,24 @@ def run_campaign(config):
         
         key = calculate_hexagram(dt)
         advice = adv_map.get(key, "")
-        
         action, percent = analyze_smart_action(advice)
         
-        qty, note = 0, ""
-        display_label = "GIỮ"
+        qty, note, display_label = 0, "", "GIỮ"
 
-        # --- LOGIC KHỚP LỆNH & TÍNH GIÁ VỐN ---
+        # Trading Logic
         if action == "MUA":
             amount_to_spend = cash * percent
-            if amount_to_spend > 1: # Fix lỗi min amount
+            if amount_to_spend > 1:
                 qty = amount_to_spend / price
-                if "Stock" in market or "VNIndex" in market:
-                    qty = int(qty // 100) * 100
-                
+                if "Stock" in market or "VNIndex" in market: qty = int(qty // 100) * 100
                 if qty > 0:
-                    # Tính giá vốn trung bình MỚI
-                    current_value = stock * avg_price
                     new_value = qty * price
-                    stock += qty # Cộng thêm hàng
-                    avg_price = (current_value + new_value) / stock # Update giá bình quân
-                    
+                    current_val = stock * avg_price
+                    stock += qty
+                    avg_price = (current_val + new_value) / stock
                     cash -= qty * price
                     note = f"MUA {int(percent*100)}%"
                     display_label = "MUA"
-            
             if display_label != "MUA" and stock > 0: display_label = "✊ GIỮ"
 
         elif action == "BÁN":
@@ -215,40 +214,24 @@ def run_campaign(config):
             if "Stock" in market or "VNIndex" in market:
                 qty_to_sell = int(qty_to_sell // 100) * 100
                 if qty_to_sell > stock: qty_to_sell = stock
-            
             if qty_to_sell > 0:
                 stock -= qty_to_sell
                 cash += qty_to_sell * price
                 note = f"BÁN {int(percent*100)}%"
                 display_label = "BÁN"
-                
-                # Nếu bán hết sạch -> Reset giá vốn
                 if stock == 0: avg_price = 0
-            
             if display_label != "BÁN" and stock == 0: display_label = "⛔ KHÔNG MUA"
-
-        else: # GIỮ
+        else:
             if stock > 0: display_label = "✊ GIỮ"
             else: display_label = "⛔ KHÔNG MUA"
 
-        # --- TÍNH TOÁN CÁC CHỈ SỐ MỚI ---
-        # 1. Tổng tài sản
-        current_asset_value = stock * price
-        equity = cash + current_asset_value
-        
-        # 2. ROI Tổng (So với vốn ban đầu)
+        current_asset_val = stock * price
+        equity = cash + current_asset_val
         roi_total = (equity - capital) / capital
-        
-        # 3. Tỷ trọng (Asset Allocation)
-        allocation = current_asset_value / equity if equity > 0 else 0
-        
-        # 4. % Lời/Lỗ CP (Holding Performance)
-        # Chỉ tính khi đang có hàng. (Giá hiện tại - Giá vốn) / Giá vốn
-        holding_pnl = 0
-        if stock > 0 and avg_price > 0:
-            holding_pnl = (price - avg_price) / avg_price
-        
-        # --- GHI VÀO NOTION ---
+        allocation = current_asset_val / equity if equity > 0 else 0
+        holding_pnl = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
+
+        # GHI VÀO NOTION & GỬI TELEGRAM
         if time_sig not in existing:
             icon = "⚪"
             if "MUA" in display_label: icon = "🟢"
@@ -270,15 +253,27 @@ def run_campaign(config):
                     "Số Dư": {"number": equity},
                     "ROI": {"number": roi_total},
                     "Giờ Giao Dịch": {"date": {"start": dt.isoformat()}},
-                    # HAI CỘT MỚI:
                     "Tỷ Trọng": {"number": allocation},
                     "% Lời/Lỗ CP": {"number": holding_pnl}
                 }
             }
             notion_request("pages", "POST", payload)
-            print(f"   ✅ [GHI] {title} | Alloc: {allocation:.0%} | PnL: {holding_pnl:.2%}")
+            print(f"   ✅ [GHI] {title}")
             existing.add(time_sig)
             new_logs_count += 1
+            
+            # [NEW] GỬI TELEGRAM (Chỉ gửi khi có lệnh Mua/Bán quan trọng để tránh spam)
+            if "MUA" in display_label or "BÁN" in display_label:
+                msg = (
+                    f"🔔 <b>TÍN HIỆU KHỚP LỆNH: {symbol}</b>\n"
+                    f"{icon} <b>Lệnh:</b> {display_label}\n"
+                    f"⏰ <b>Thời gian:</b> {time_sig}\n"
+                    f"💵 <b>Giá:</b> {price:,.2f}\n"
+                    f"📊 <b>Tỷ trọng:</b> {allocation:.0%}\n"
+                    f"🔮 <b>Quẻ:</b> {key}\n"
+                    f"💡 <b>Lời khuyên:</b> {advice}"
+                )
+                send_telegram_message(msg)
 
     if new_logs_count == 0:
         print("   -> Dữ liệu đã đồng bộ.")
@@ -289,7 +284,13 @@ query = {"filter": {"property": "Trạng Thái", "status": {"equals": "Đang ch�
 res = notion_request(f"databases/{CONFIG_DB_ID}/query", "POST", query)
 
 if res and 'results' in res:
-    print(f"✅ Tìm thấy {len(res['results'])} chiến dịch.")
+    count = len(res['results'])
+    print(f"✅ Tìm thấy {count} chiến dịch.")
+    # [NEW] Gửi thông báo khởi động (để bạn biết Bot vẫn sống)
+    start_msg = f"🤖 <b>BOT KINH DỊCH ĐÃ CHẠY (V1.1)</b>\nĐang theo dõi {count} mã tài sản.\nChúc chủ nhân một ngày đại cát!"
+    send_telegram_message(start_msg)
+    
     for cfg in res['results']: run_campaign(cfg)
 else:
     print("❌ Lỗi kết nối Notion. Check Token/ID.")
+    send_telegram_message("❌ <b>CẢNH BÁO:</b> Bot không kết nối được với Notion!")
