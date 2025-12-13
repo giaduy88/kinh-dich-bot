@@ -76,6 +76,7 @@ def calculate_hexagram(dt):
     chi = 1 if dt.hour==23 or dt.hour==0 else ((dt.hour+1)//2 + 1 if dt.hour%2!=0 else dt.hour//2 + 1)
     base = ((lunar.year - 1984)%12 + 1) + lunar.month + lunar.day
     thuong, ha = base%8 or 8, (base+chi)%8 or 8
+    hao = (base+chi)%6 or 6
     id_goc = king_wen_matrix[thuong-1][ha-1]
     is_upper, line = hao>3, hao-3 if hao>3 else hao
     target = thuong if is_upper else ha
