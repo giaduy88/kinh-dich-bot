@@ -12,16 +12,16 @@ from datetime import datetime, timezone, timedelta
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 CONFIG_DB_ID = os.environ.get("CONFIG_DB_ID")
 LOG_DB_ID    = os.environ.get("LOG_DB_ID")
-# [NEW] Cấu hình Telegram
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# [NEW] CẤU HÌNH QUẢN TRỊ RỦI RO (BẠN CÓ THỂ SỬA Ở ĐÂY)
+STOP_LOSS_PCT = -0.07   # Cắt lỗ nếu lỗ -7%
+TAKE_PROFIT_PCT = 0.15  # Chốt lời nếu lãi +15%
 
 if not NOTION_TOKEN or not CONFIG_DB_ID or not LOG_DB_ID:
     print("❌ LỖI: Thiếu Notion Secrets.")
     sys.exit(1)
-
-if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-    print("⚠️ CẢNH BÁO: Thiếu Telegram Secrets. Bot sẽ chạy nhưng không gửi tin nhắn.")
 
 def extract_id(text):
     if not text: return ""
@@ -39,7 +39,7 @@ G1-B14,Vận khí tốt, có thể mua vào tích lũy.
 G23-B4,Mông lung xấu, nên hạ tỷ trọng bán bớt.
 """
 
-# --- 3. THƯ VIỆN ---
+# --- 3. THƯ VIỆN & TELEGRAM ---
 try:
     import ccxt
     from lunardate import LunarDate
@@ -47,23 +47,15 @@ except ImportError: pass
 import ccxt
 from lunardate import LunarDate
 
-# --- [NEW] HÀM GỬI TELEGRAM ---
 def send_telegram_message(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown" # Để in đậm/nghiêng cho đẹp
-        }
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
         requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        print(f"❌ Lỗi gửi Telegram: {e}")
+    except: pass
 
-# --- 4. HÀM API CHỨNG KHOÁN ---
+# --- 4. DATA FETCHING ---
 def get_stock_data(symbol):
     try:
         to_ts = int(time.time())
@@ -79,11 +71,9 @@ def get_stock_data(symbol):
                     "p": float(res['c'][i])
                 })
         return data
-    except Exception as e:
-        print(f"❌ Lỗi Stock {symbol}: {e}")
-        return []
+    except: return []
 
-# --- 5. HÀM NOTION ---
+# --- 5. NOTION ---
 def notion_request(endpoint, method="POST", payload=None):
     url = f"https://api.notion.com/v1/{endpoint}"
     headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
@@ -93,14 +83,13 @@ def notion_request(endpoint, method="POST", payload=None):
         return response.json() if response.status_code == 200 else None
     except: return None
 
-# --- 6. LOAD FILE ---
+# --- 6. CORE LOGIC ---
 def load_advice_data():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     file_path = os.path.join(current_dir, 'data_loi_khuyen.csv')
     if os.path.exists(file_path): return pd.read_csv(file_path)
     return pd.read_csv(io.StringIO(BACKUP_CSV))
 
-# --- 7. LOGIC KINH DỊCH ---
 king_wen_matrix = [[1, 10, 13, 25, 44, 6, 33, 12], [43, 58, 49, 17, 28, 47, 31, 45], [14, 38, 30, 21, 50, 64, 56, 35], [34, 54, 55, 51, 32, 40, 62, 16], [9, 61, 37, 42, 57, 59, 53, 20], [5, 60, 63, 3, 48, 29, 39, 8], [26, 41, 22, 27, 18, 4, 52, 23], [11, 19, 36, 24, 46, 7, 15, 2]]
 
 def calculate_hexagram(dt):
@@ -132,7 +121,6 @@ def analyze_smart_action(text):
     if any(w in text for w in normal_sell): return "BÁN", 0.5
     return "GIỮ", 0.0
 
-# --- 8. KIỂM TRA LỊCH SỬ ---
 def get_existing_signatures(symbol):
     payload = {"filter": {"property": "Mã", "rich_text": {"contains": symbol}}, "sorts": [{"property": "Giờ Giao Dịch", "direction": "descending"}], "page_size": 100}
     try: data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
@@ -149,7 +137,7 @@ def get_existing_signatures(symbol):
             except: pass
     return s
 
-# --- 9. HÀM CHẠY CHIẾN DỊCH (V1.1) ---
+# --- 7. RUN CAMPAIGN (V1.2 - DEFENSE SHIELD) ---
 def run_campaign(config):
     try:
         name = config['properties']['Tên Chiến Dịch']['title'][0]['plain_text']
@@ -160,7 +148,6 @@ def run_campaign(config):
 
     print(f"\n🚀 Processing: {name} ({symbol})")
     
-    # Lấy Data
     data = []
     if "Binance" in market or "Crypto" in market:
         try:
@@ -179,7 +166,6 @@ def run_campaign(config):
     adv_map = dict(zip(df_adv['KEY_ID'], df_adv['Lời Khuyên']))
     existing = get_existing_signatures(symbol)
     
-    # Portfolio Init
     cash, stock, equity, avg_price = capital, 0, capital, 0
     new_logs_count = 0
 
@@ -187,55 +173,93 @@ def run_campaign(config):
         dt, price = item['t'], item['p']
         time_sig = dt.strftime('%H:%M %d/%m')
         
+        # 1. Tính toán PnL hiện tại (trước khi ra quyết định)
+        holding_pnl = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
+
+        # 2. Logic Kinh Dịch (Cơ bản)
         key = calculate_hexagram(dt)
         advice = adv_map.get(key, "")
         action, percent = analyze_smart_action(advice)
         
         qty, note, display_label = 0, "", "GIỮ"
 
-        # Trading Logic
-        if action == "MUA":
-            amount_to_spend = cash * percent
-            if amount_to_spend > 1:
-                qty = amount_to_spend / price
-                if "Stock" in market or "VNIndex" in market: qty = int(qty // 100) * 100
-                if qty > 0:
-                    new_value = qty * price
-                    current_val = stock * avg_price
-                    stock += qty
-                    avg_price = (current_val + new_value) / stock
-                    cash -= qty * price
-                    note = f"MUA {int(percent*100)}%"
-                    display_label = "MUA"
-            if display_label != "MUA" and stock > 0: display_label = "✊ GIỮ"
+        # 3. [NEW] LỚP PHÒNG THỦ (Risk Management Layer)
+        risk_action = None
+        if stock > 0: # Chỉ check khi đang có hàng
+            if holding_pnl <= STOP_LOSS_PCT:
+                risk_action = "STOP_LOSS"
+            elif holding_pnl >= TAKE_PROFIT_PCT:
+                risk_action = "TAKE_PROFIT"
 
-        elif action == "BÁN":
-            qty_to_sell = stock * percent
+        # 4. QUYẾT ĐỊNH CUỐI CÙNG (Ưu tiên Phòng thủ -> rồi mới đến Kinh Dịch)
+        final_action = action
+        final_percent = percent
+
+        if risk_action == "STOP_LOSS":
+            final_action = "BÁN"
+            final_percent = 1.0 # Bán hết sạch
+            advice = f"⚠️ CẮT LỖ KHẨN CẤP (Lỗ {holding_pnl:.1%})" # Ghi đè lời khuyên
+        elif risk_action == "TAKE_PROFIT":
+            final_action = "BÁN"
+            final_percent = 0.5 # Bán 50%
+            advice = f"💰 CHỐT LỜI BẢO TOÀN (Lãi {holding_pnl:.1%})"
+
+        # 5. KHỚP LỆNH
+        if final_action == "MUA":
+            # (Không mua thêm nếu đang lỗ nặng - Logic an toàn phụ)
+            if holding_pnl < -0.05 and stock > 0:
+                display_label = "✊ GIỮ (LỖ > 5% - KHÔNG TBC)"
+            else:
+                amount_to_spend = cash * final_percent
+                if amount_to_spend > 1:
+                    qty = amount_to_spend / price
+                    if "Stock" in market or "VNIndex" in market: qty = int(qty // 100) * 100
+                    if qty > 0:
+                        new_value = qty * price
+                        current_val = stock * avg_price
+                        stock += qty
+                        avg_price = (current_val + new_value) / stock
+                        cash -= qty * price
+                        note = f"MUA {int(final_percent*100)}%"
+                        display_label = "MUA"
+                if display_label != "MUA" and stock > 0: display_label = "✊ GIỮ"
+
+        elif final_action == "BÁN":
+            qty_to_sell = stock * final_percent
             if "Stock" in market or "VNIndex" in market:
                 qty_to_sell = int(qty_to_sell // 100) * 100
                 if qty_to_sell > stock: qty_to_sell = stock
             if qty_to_sell > 0:
                 stock -= qty_to_sell
                 cash += qty_to_sell * price
-                note = f"BÁN {int(percent*100)}%"
-                display_label = "BÁN"
+                note = f"BÁN {int(final_percent*100)}%"
+                
+                # Đổi nhãn nếu là lệnh của Risk Management
+                if risk_action == "STOP_LOSS": display_label = "✂️ CẮT LỖ"
+                elif risk_action == "TAKE_PROFIT": display_label = "💵 CHỐT LỜI"
+                else: display_label = "BÁN"
+
                 if stock == 0: avg_price = 0
-            if display_label != "BÁN" and stock == 0: display_label = "⛔ KHÔNG MUA"
+            if display_label not in ["BÁN", "✂️ CẮT LỖ", "💵 CHỐT LỜI"] and stock == 0: display_label = "⛔ KHÔNG MUA"
         else:
             if stock > 0: display_label = "✊ GIỮ"
             else: display_label = "⛔ KHÔNG MUA"
 
+        # Tính toán lại chỉ số sau khớp lệnh
         current_asset_val = stock * price
         equity = cash + current_asset_val
         roi_total = (equity - capital) / capital
         allocation = current_asset_val / equity if equity > 0 else 0
-        holding_pnl = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
+        # PnL sau lệnh (nếu còn hàng)
+        holding_pnl_new = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
-        # GHI VÀO NOTION & GỬI TELEGRAM
+        # GHI VÀO NOTION
         if time_sig not in existing:
             icon = "⚪"
             if "MUA" in display_label: icon = "🟢"
             if "BÁN" in display_label: icon = "🔴"
+            if "CẮT LỖ" in display_label: icon = "⚠️" # Icon mới
+            if "CHỐT LỜI" in display_label: icon = "💰" # Icon mới
             if "GIỮ" in display_label: icon = "✊"
             if "KHÔNG MUA" in display_label: icon = "⛔"
 
@@ -254,7 +278,7 @@ def run_campaign(config):
                     "ROI": {"number": roi_total},
                     "Giờ Giao Dịch": {"date": {"start": dt.isoformat()}},
                     "Tỷ Trọng": {"number": allocation},
-                    "% Lời/Lỗ CP": {"number": holding_pnl}
+                    "% Lời/Lỗ CP": {"number": holding_pnl_new}
                 }
             }
             notion_request("pages", "POST", payload)
@@ -262,16 +286,15 @@ def run_campaign(config):
             existing.add(time_sig)
             new_logs_count += 1
             
-            # [NEW] GỬI TELEGRAM (Chỉ gửi khi có lệnh Mua/Bán quan trọng để tránh spam)
-            if "MUA" in display_label or "BÁN" in display_label:
+            # GỬI TELEGRAM (Chỉ Mua/Bán/Cắt Lỗ/Chốt Lời)
+            if any(x in display_label for x in ["MUA", "BÁN", "CẮT LỖ", "CHỐT LỜI"]):
                 msg = (
-                    f"🔔 <b>TÍN HIỆU KHỚP LỆNH: {symbol}</b>\n"
+                    f"🔔 <b>TÍN HIỆU: {symbol}</b>\n"
                     f"{icon} <b>Lệnh:</b> {display_label}\n"
                     f"⏰ <b>Thời gian:</b> {time_sig}\n"
                     f"💵 <b>Giá:</b> {price:,.2f}\n"
-                    f"📊 <b>Tỷ trọng:</b> {allocation:.0%}\n"
-                    f"🔮 <b>Quẻ:</b> {key}\n"
-                    f"💡 <b>Lời khuyên:</b> {advice}"
+                    f"📈 <b>Hiệu suất lệnh:</b> {holding_pnl:.1%} (Trước khi bán)\n"
+                    f"💡 <b>Lý do:</b> {advice}"
                 )
                 send_telegram_message(msg)
 
@@ -284,13 +307,9 @@ query = {"filter": {"property": "Trạng Thái", "status": {"equals": "Đang ch�
 res = notion_request(f"databases/{CONFIG_DB_ID}/query", "POST", query)
 
 if res and 'results' in res:
-    count = len(res['results'])
-    print(f"✅ Tìm thấy {count} chiến dịch.")
-    # [NEW] Gửi thông báo khởi động (để bạn biết Bot vẫn sống)
-    start_msg = f"🤖 <b>BOT KINH DỊCH ĐÃ CHẠY (V1.1)</b>\nĐang theo dõi {count} mã tài sản.\nChúc chủ nhân một ngày đại cát!"
-    send_telegram_message(start_msg)
-    
+    print(f"✅ Tìm thấy {len(res['results'])} chiến dịch.")
+    # Chỉ gửi tin nhắn start 1 lần để tránh spam
+    # send_telegram_message(f"🤖 Bot V1.2 (Defense) đã chạy.") 
     for cfg in res['results']: run_campaign(cfg)
 else:
-    print("❌ Lỗi kết nối Notion. Check Token/ID.")
-    send_telegram_message("❌ <b>CẢNH BÁO:</b> Bot không kết nối được với Notion!")
+    print("❌ Lỗi kết nối Notion.")
