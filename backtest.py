@@ -13,37 +13,69 @@ try:
 except ImportError:
     pass
 
-# --- HÀM TẢI DỮ LIỆU ---
+# --- HÀM TẢI DỮ LIỆU (ĐÃ SỬA LỖI GIỚI HẠN 1000 NẾN) ---
 def get_historical_data(symbol, days):
-    to_ts = int(time.time())
-    from_ts = to_ts - (days * 24 * 3600)
+    # Tính toán thời gian
+    end_ts = int(time.time()) * 1000 # Đổi ra miliseconds cho CCXT
+    start_ts = end_ts - (days * 24 * 3600 * 1000)
     
-    # 1. XỬ LÝ CRYPTO
+    # 1. XỬ LÝ CRYPTO (KuCoin/Binance)
     if "/USDT" in symbol.upper() or "USDT" in symbol.upper():
         try:
-            # Chuẩn hóa mã (VD: BTCUSDT -> BTC/USDT)
+            # Chuẩn hóa mã
             sym_map = symbol.upper()
             if "USDT" in sym_map and "/" not in sym_map:
                 sym_map = sym_map.replace("USDT", "/USDT")
-            elif "/USDT" not in sym_map: # Trường hợp gõ tắt BTC
+            elif "/USDT" not in sym_map:
                 sym_map += "/USDT"
 
-            ex = ccxt.kucoin() # Dùng KuCoin để né chặn IP
-            ohlcv = ex.fetch_ohlcv(sym_map, '1h', limit=min(days*24, 1000))
-            data = []
-            for c in ohlcv:
-                data.append({
-                    "t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))),
-                    "p": float(c[4])
-                })
-            return data, "OK", "CRYPTO"
+            ex = ccxt.kucoin() 
+            
+            # [FIX] LOGIC VÒNG LẶP ĐỂ TẢI DỮ LIỆU DÀI (>1000 NẾN)
+            all_ohlcv = []
+            current_since = start_ts
+            
+            # Loop cho đến khi lấy đủ dữ liệu đến hiện tại
+            while current_since < end_ts:
+                # Mỗi lần lấy tối đa 1000 nến
+                ohlcv = ex.fetch_ohlcv(sym_map, '1h', since=current_since, limit=1000)
+                
+                if not ohlcv: break # Hết dữ liệu
+                
+                start_candle = ohlcv[0][0]
+                last_candle = ohlcv[-1][0]
+                
+                # Nếu nến mới lấy trùng với nến cũ thì dừng để tránh lặp vô tận
+                if len(all_ohlcv) > 0 and start_candle <= all_ohlcv[-1]['ts_raw']:
+                    break
+                
+                # Append vào list tổng
+                for c in ohlcv:
+                    if c[0] >= start_ts and c[0] <= end_ts:
+                         all_ohlcv.append({
+                            "ts_raw": c[0], # Lưu raw để check lặp
+                            "t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))),
+                            "p": float(c[4])
+                        })
+                
+                # Cập nhật thời gian cho lần lấy tiếp theo (Nến cuối + 1 giờ)
+                current_since = last_candle + (60 * 60 * 1000)
+                
+                # Nghỉ nhẹ 0.1s để tránh bị sàn chặn vì spam request
+                time.sleep(0.1)
+
+            return all_ohlcv, "OK", "CRYPTO"
+            
         except Exception as e:
             return [], f"Lỗi Crypto: {str(e)}", "ERROR"
 
-    # 2. XỬ LÝ CHỨNG KHOÁN
+    # 2. XỬ LÝ CHỨNG KHOÁN (Entrade API đã hỗ trợ range time, không cần loop)
     else:
         try:
-            url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
+            to_ts_sec = int(time.time())
+            from_ts_sec = to_ts_sec - (days * 24 * 3600)
+            
+            url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts_sec}&to={to_ts_sec}"
             res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).json()
             data = []
             if 't' in res and res['t']:
@@ -56,7 +88,7 @@ def get_historical_data(symbol, days):
         except Exception as e:
             return [], f"Lỗi Stock: {str(e)}", "ERROR"
 
-# --- INDICATORS & LOGIC ---
+# --- CÁC HÀM LOGIC KHÁC (GIỮ NGUYÊN) ---
 def add_indicators(df):
     if df.empty: return df
     df['SMA20'] = df['p'].rolling(window=20).mean()
@@ -112,15 +144,15 @@ def run_backtest_core(symbol, days, advice_map):
     if len(data) < 20:
         return f"⚠️ Dữ liệu quá ít ({len(data)} nến) để backtest."
 
-    # [FIX] ĐIỀU CHỈNH VỐN THEO LOẠI TÀI SẢN
+    # Vốn ban đầu
     if asset_type == "CRYPTO":
-        capital = 5_000 # 5000 USD
+        capital = 5_000 
         currency = "$"
-        min_order = 100 # Min order 100$
+        min_order = 100 
     else:
-        capital = 100_000_000 # 100 Triệu VND
+        capital = 100_000_000 
         currency = "đ"
-        min_order = 5_000_000 # Min order 5tr
+        min_order = 5_000_000
 
     cash, stock, avg_price = capital, 0, 0
     trade_count, win_count, loss_count = 0, 0, 0
@@ -178,7 +210,6 @@ def run_backtest_core(symbol, days, advice_map):
     roi = (final_equity - capital) / capital
     win_rate = (win_count / trade_count) if trade_count > 0 else 0
     
-    # Format số tiền cho đẹp
     def fmt_money(val):
         if asset_type == "CRYPTO": return f"{val:,.2f}"
         return f"{val/1e6:,.1f} tr"
