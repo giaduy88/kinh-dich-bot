@@ -18,25 +18,29 @@ def get_historical_data(symbol, days):
     to_ts = int(time.time())
     from_ts = to_ts - (days * 24 * 3600)
     
-    # 1. XỬ LÝ CRYPTO (Nếu có /USDT)
-    if "/USDT" in symbol.upper():
+    # 1. XỬ LÝ CRYPTO
+    if "/USDT" in symbol.upper() or "USDT" in symbol.upper():
         try:
-            # [FIX] Dùng KuCoin thay vì Binance để không bị chặn IP Mỹ
-            ex = ccxt.kucoin() 
-            
-            # Lấy nến 1h. Limit của KuCoin/CCXT
-            ohlcv = ex.fetch_ohlcv(symbol.upper(), '1h', limit=min(days*24, 1000))
+            # Chuẩn hóa mã (VD: BTCUSDT -> BTC/USDT)
+            sym_map = symbol.upper()
+            if "USDT" in sym_map and "/" not in sym_map:
+                sym_map = sym_map.replace("USDT", "/USDT")
+            elif "/USDT" not in sym_map: # Trường hợp gõ tắt BTC
+                sym_map += "/USDT"
+
+            ex = ccxt.kucoin() # Dùng KuCoin để né chặn IP
+            ohlcv = ex.fetch_ohlcv(sym_map, '1h', limit=min(days*24, 1000))
             data = []
             for c in ohlcv:
                 data.append({
                     "t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))),
                     "p": float(c[4])
                 })
-            return data, "OK"
+            return data, "OK", "CRYPTO"
         except Exception as e:
-            return [], f"Lỗi Crypto (KuCoin): {str(e)}"
+            return [], f"Lỗi Crypto: {str(e)}", "ERROR"
 
-    # 2. XỬ LÝ CHỨNG KHOÁN (Mặc định)
+    # 2. XỬ LÝ CHỨNG KHOÁN
     else:
         try:
             url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
@@ -48,11 +52,11 @@ def get_historical_data(symbol, days):
                         "t": datetime.fromtimestamp(res['t'][i], tz=timezone(timedelta(hours=7))),
                         "p": float(res['c'][i])
                     })
-            return data, "OK"
+            return data, "OK", "STOCK"
         except Exception as e:
-            return [], f"Lỗi Stock: {str(e)}"
+            return [], f"Lỗi Stock: {str(e)}", "ERROR"
 
-# --- CÁC HÀM LOGIC (GIỮ NGUYÊN) ---
+# --- INDICATORS & LOGIC ---
 def add_indicators(df):
     if df.empty: return df
     df['SMA20'] = df['p'].rolling(window=20).mean()
@@ -72,7 +76,6 @@ def calculate_hexagram(dt):
     chi = 1 if dt.hour==23 or dt.hour==0 else ((dt.hour+1)//2 + 1 if dt.hour%2!=0 else dt.hour//2 + 1)
     base = ((lunar.year - 1984)%12 + 1) + lunar.month + lunar.day
     thuong, ha = base%8 or 8, (base+chi)%8 or 8
-    hao = (base+chi)%6 or 6
     id_goc = king_wen_matrix[thuong-1][ha-1]
     is_upper, line = hao>3, hao-3 if hao>3 else hao
     target = thuong if is_upper else ha
@@ -97,7 +100,7 @@ def analyze_smart_action(text):
     return "GIỮ", 0.0
 
 def run_backtest_core(symbol, days, advice_map):
-    raw_data, msg = get_historical_data(symbol, days)
+    raw_data, msg, asset_type = get_historical_data(symbol, days)
     if not raw_data:
         return f"❌ Lỗi tải dữ liệu {symbol}: {msg}"
 
@@ -108,8 +111,16 @@ def run_backtest_core(symbol, days, advice_map):
     if len(data) < 20:
         return f"⚠️ Dữ liệu quá ít ({len(data)} nến) để backtest."
 
-    # Init Portfolio
-    capital = 100_000_000
+    # [FIX] ĐIỀU CHỈNH VỐN THEO LOẠI TÀI SẢN
+    if asset_type == "CRYPTO":
+        capital = 5_000 # 5000 USD
+        currency = "$"
+        min_order = 100 # Min order 100$
+    else:
+        capital = 100_000_000 # 100 Triệu VND
+        currency = "đ"
+        min_order = 5_000_000 # Min order 5tr
+
     cash, stock, avg_price = capital, 0, 0
     trade_count, win_count, loss_count = 0, 0, 0
     stop_loss_pct, take_profit_pct = -0.07, 0.15
@@ -118,39 +129,30 @@ def run_backtest_core(symbol, days, advice_map):
         dt, price = item['t'], item['p']
         sma20, rsi = item.get('SMA20', 0), item.get('RSI', 50)
         
-        # PnL Check
         holding_pnl = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
-        # Logic Kinh Dịch
         key = calculate_hexagram(dt)
         advice = advice_map.get(key, "")
         action, percent = analyze_smart_action(advice)
         
-        # Risk Management
         risk_action = None
         if stock > 0:
             if holding_pnl <= stop_loss_pct: risk_action = "STOP_LOSS"
             elif holding_pnl >= take_profit_pct: risk_action = "TAKE_PROFIT"
 
-        # Technical Filter
         if action == "MUA":
             if price < sma20 and rsi > 35: action = "GIỮ"
             if rsi > 75: action = "GIỮ"
 
-        # Final Decision
         final_action, final_percent = action, percent
         if risk_action == "STOP_LOSS": final_action, final_percent = "BÁN", 1.0
         elif risk_action == "TAKE_PROFIT": final_action, final_percent = "BÁN", 0.5
 
-        # Execution
         if final_action == "MUA":
             amt = cash * final_percent
-            if amt > 50000:
+            if amt > min_order:
                 qty = amt / price
-                # Nếu là Stock thì làm tròn lô 100, Crypto thì không cần
-                if "/USDT" not in symbol.upper():
-                    qty = int(qty // 100) * 100
-                
+                if asset_type == "STOCK": qty = int(qty // 100) * 100
                 if qty > 0:
                     current_val, new_val = stock * avg_price, qty * price
                     stock += qty
@@ -159,10 +161,8 @@ def run_backtest_core(symbol, days, advice_map):
 
         elif final_action == "BÁN":
             qty = stock * final_percent
-            # Nếu là Stock thì làm tròn lô 100
-            if "/USDT" not in symbol.upper():
-                qty = int(qty // 100) * 100
-                if qty > stock: qty = stock
+            if asset_type == "STOCK": qty = int(qty // 100) * 100
+            if qty > stock: qty = stock
             
             if qty > 0:
                 stock -= qty
@@ -173,18 +173,22 @@ def run_backtest_core(symbol, days, advice_map):
                 trade_count += 1
                 if stock == 0: avg_price = 0
 
-    # Summary
     final_equity = cash + (stock * data[-1]['p'])
     roi = (final_equity - capital) / capital
     win_rate = (win_count / trade_count) if trade_count > 0 else 0
     
+    # Format số tiền cho đẹp
+    def fmt_money(val):
+        if asset_type == "CRYPTO": return f"{val:,.2f}"
+        return f"{val/1e6:,.1f} tr"
+
     report = (
-        f"📊 <b>KẾT QUẢ BACKTEST: {symbol}</b>\n"
+        f"📊 <b>KẾT QUẢ BACKTEST: {symbol.upper()}</b>\n"
         f"⏳ Thời gian: {days} ngày qua\n"
         f"🕯 Số nến: {len(data)}\n"
         f"--------------------------\n"
-        f"💰 Vốn đầu: {capital/1e6:.0f} tr\n"
-        f"💎 Vốn cuối: {final_equity/1e6:.1f} tr\n"
+        f"💰 Vốn đầu: {currency}{fmt_money(capital)}\n"
+        f"💎 Vốn cuối: {currency}{fmt_money(final_equity)}\n"
         f"🚀 <b>ROI: {roi:+.2%}</b>\n"
         f"--------------------------\n"
         f"🛒 Tổng lệnh: {trade_count}\n"
