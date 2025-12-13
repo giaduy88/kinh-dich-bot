@@ -6,11 +6,6 @@ import os
 import io
 from datetime import datetime, timezone, timedelta
 
-# --- CẤU HÌNH MẶC ĐỊNH ---
-# (Các giá trị này sẽ bị ghi đè khi gọi từ Telegram)
-DEFAULT_SYMBOL = "HPG"
-DEFAULT_DAYS = 180
-
 # --- THƯ VIỆN ---
 try:
     import ccxt
@@ -23,41 +18,41 @@ def get_historical_data(symbol, days):
     to_ts = int(time.time())
     from_ts = to_ts - (days * 24 * 3600)
     
-    # Tự động nhận diện Crypto (có chứa USDT hoặc ký tự /)
-    is_crypto = "USDT" in symbol.upper() or "/" in symbol
-    
-    data = []
-    if is_crypto:
+    # 1. XỬ LÝ CRYPTO (Nếu có /USDT)
+    if "/USDT" in symbol.upper():
         try:
-            # Dùng CCXT lấy dữ liệu Crypto
-            symbol_map = symbol.upper().replace("USDT", "/USDT") if "/" not in symbol else symbol
-            ex = ccxt.binance() # Hoặc kucoin
-            # Lấy nến 1h. Limit tối đa của API thường là 500-1000 nến
-            ohlcv = ex.fetch_ohlcv(symbol_map, '1h', limit=min(days*24, 1000))
+            # [FIX] Dùng KuCoin thay vì Binance để không bị chặn IP Mỹ
+            ex = ccxt.kucoin() 
+            
+            # Lấy nến 1h. Limit của KuCoin/CCXT
+            ohlcv = ex.fetch_ohlcv(symbol.upper(), '1h', limit=min(days*24, 1000))
+            data = []
             for c in ohlcv:
                 data.append({
                     "t": datetime.fromtimestamp(c[0]/1000, tz=timezone(timedelta(hours=7))),
                     "p": float(c[4])
                 })
+            return data, "OK"
         except Exception as e:
-            return [], f"Lỗi Crypto: {str(e)}"
+            return [], f"Lỗi Crypto (KuCoin): {str(e)}"
+
+    # 2. XỬ LÝ CHỨNG KHOÁN (Mặc định)
     else:
-        # Dùng API DNSE cho Stock
         try:
             url = f"https://services.entrade.com.vn/chart-api/v2/ohlcs/stock?symbol={symbol}&resolution=1H&from={from_ts}&to={to_ts}"
             res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}).json()
+            data = []
             if 't' in res and res['t']:
                 for i in range(len(res['t'])):
                     data.append({
                         "t": datetime.fromtimestamp(res['t'][i], tz=timezone(timedelta(hours=7))),
                         "p": float(res['c'][i])
                     })
+            return data, "OK"
         except Exception as e:
             return [], f"Lỗi Stock: {str(e)}"
-            
-    return data, "OK"
 
-# --- CÁC HÀM LOGIC (Dùng chung logic với main.py) ---
+# --- CÁC HÀM LOGIC (GIỮ NGUYÊN) ---
 def add_indicators(df):
     if df.empty: return df
     df['SMA20'] = df['p'].rolling(window=20).mean()
@@ -68,7 +63,6 @@ def add_indicators(df):
     df['RSI'] = 100 - (100 / (1 + rs))
     return df.fillna(0)
 
-# Ma trận King Wen (Kinh Dịch)
 king_wen_matrix = [[1, 10, 13, 25, 44, 6, 33, 12], [43, 58, 49, 17, 28, 47, 31, 45], [14, 38, 30, 21, 50, 64, 56, 35], [34, 54, 55, 51, 32, 40, 62, 16], [9, 61, 37, 42, 57, 59, 53, 20], [5, 60, 63, 3, 48, 29, 39, 8], [26, 41, 22, 27, 18, 4, 52, 23], [11, 19, 36, 24, 46, 7, 15, 2]]
 
 def calculate_hexagram(dt):
@@ -102,7 +96,6 @@ def analyze_smart_action(text):
     if any(w in text for w in normal_sell): return "BÁN", 0.5
     return "GIỮ", 0.0
 
-# --- CORE BACKTEST FUNCTION (Được gọi từ main.py) ---
 def run_backtest_core(symbol, days, advice_map):
     raw_data, msg = get_historical_data(symbol, days)
     if not raw_data:
@@ -121,8 +114,6 @@ def run_backtest_core(symbol, days, advice_map):
     trade_count, win_count, loss_count = 0, 0, 0
     stop_loss_pct, take_profit_pct = -0.07, 0.15
     
-    history_log = []
-
     for item in data:
         dt, price = item['t'], item['p']
         sma20, rsi = item.get('SMA20', 0), item.get('RSI', 50)
@@ -152,45 +143,34 @@ def run_backtest_core(symbol, days, advice_map):
         elif risk_action == "TAKE_PROFIT": final_action, final_percent = "BÁN", 0.5
 
         # Execution
-        executed = False
-        pnl_realized = 0
-        type_str = ""
-
         if final_action == "MUA":
             amt = cash * final_percent
-            if amt > 50000: # Min order
+            if amt > 50000:
                 qty = amt / price
-                # Làm tròn cổ phiếu (lô 100) nếu không phải Crypto
-                if "USDT" not in symbol.upper() and "/" not in symbol:
+                # Nếu là Stock thì làm tròn lô 100, Crypto thì không cần
+                if "/USDT" not in symbol.upper():
                     qty = int(qty // 100) * 100
                 
                 if qty > 0:
-                    current_val = stock * avg_price
-                    new_val = qty * price
+                    current_val, new_val = stock * avg_price, qty * price
                     stock += qty
                     avg_price = (current_val + new_val) / stock
                     cash -= qty * price
-                    executed = True
-                    type_str = "MUA"
 
         elif final_action == "BÁN":
             qty = stock * final_percent
-            if "USDT" not in symbol.upper() and "/" not in symbol:
+            # Nếu là Stock thì làm tròn lô 100
+            if "/USDT" not in symbol.upper():
                 qty = int(qty // 100) * 100
                 if qty > stock: qty = stock
             
             if qty > 0:
                 stock -= qty
                 cash += qty * price
-                executed = True
-                type_str = risk_action if risk_action else "BÁN"
-                
-                # Check Win/Loss
                 trade_pnl = (price - avg_price) * qty
                 if trade_pnl > 0: win_count += 1
                 elif trade_pnl < 0: loss_count += 1
                 trade_count += 1
-                
                 if stock == 0: avg_price = 0
 
     # Summary
@@ -212,8 +192,3 @@ def run_backtest_core(symbol, days, advice_map):
         f"🎯 Win Rate: {win_rate:.1%}"
     )
     return report
-
-# --- MAIN BLOCK (Để test offline) ---
-if __name__ == "__main__":
-    # Mock data để test file này chạy độc lập
-    print(run_backtest_core("HPG", 180, {}))
