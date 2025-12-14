@@ -12,7 +12,7 @@ from datetime import datetime, timezone, timedelta
 try: from backtest import run_backtest_core
 except ImportError: pass
 
-# --- CẤU HÌNH ---
+# --- 1. CẤU HÌNH ---
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 CONFIG_DB_ID = os.environ.get("CONFIG_DB_ID")
 LOG_DB_ID    = os.environ.get("LOG_DB_ID")
@@ -59,7 +59,7 @@ def send_telegram_message(message):
 
 def check_telegram_command(adv_map):
     if not TELEGRAM_TOKEN: return
-    print("📩 Đang kiểm tra tin nhắn Telegram...")
+    print("📩 [BUILD LOG] Đang kiểm tra tin nhắn Telegram...")
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
         res = requests.get(url, timeout=10).json()
@@ -207,16 +207,17 @@ def run_campaign(config):
     
     cash, stock, avg_price = capital, 0, 0
     new_logs_count = 0
-    
-    # Xác định phí
     fee_rate = FEE_CRYPTO if is_crypto else FEE_STOCK
 
     # --- SIMULATION ---
-    for item in data_to_trade:
+    for i, item in enumerate(data_to_trade):
         dt, price = item['t'], item['p']
         sma20, rsi = item.get('SMA20', 0), item.get('RSI', 50)
         time_sig = dt.strftime('%H:%M %d/%m')
         holding_pnl = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
+        
+        # Biến cờ kiểm tra nến cuối cùng
+        is_last_candle = (i == len(data_to_trade) - 1)
 
         key = calculate_hexagram(dt)
         advice = adv_map.get(key, "")
@@ -240,7 +241,6 @@ def run_campaign(config):
         
         display_label, qty, note = "GIỮ", 0, ""
 
-        # [UPDATE] KHỚP LỆNH CÓ PHÍ
         if final_action == "MUA":
             amt = cash * final_percent
             if amt > 1:
@@ -251,9 +251,8 @@ def run_campaign(config):
                     fee_val = buy_val * fee_rate
                     current_val = stock * avg_price
                     stock += qty
-                    # Giá vốn trung bình (không đổi vì phí trừ vào tiền)
                     avg_price = (current_val + buy_val) / stock 
-                    cash -= (buy_val + fee_val) # Trừ tiền hàng + phí
+                    cash -= (buy_val + fee_val)
                     display_label = "MUA"
             if display_label != "MUA" and stock > 0: display_label = "✊ GIỮ"
 
@@ -265,7 +264,7 @@ def run_campaign(config):
                 sell_val = qty_sell * price
                 fee_val = sell_val * fee_rate
                 stock -= qty_sell
-                cash += (sell_val - fee_val) # Cộng tiền hàng - phí
+                cash += (sell_val - fee_val)
                 display_label = risk_action if risk_action else "BÁN"
                 if risk_action == "STOP_LOSS": display_label = "✂️ CẮT LỖ"
                 elif risk_action == "TAKE_PROFIT": display_label = "💵 CHỐT LỜI"
@@ -280,7 +279,7 @@ def run_campaign(config):
         allocation = current_asset_val / equity if equity > 0 else 0
         holding_pnl_new = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
-        # GHI LOG & GỬI ALERT
+        # PHẦN 1: GHI NOTION (Chỉ ghi khi chưa có)
         if time_sig not in existing:
             icon = "⚪"
             if "MUA" in display_label: icon = "🟢"
@@ -310,7 +309,19 @@ def run_campaign(config):
             notion_request("pages", "POST", payload)
             existing.add(time_sig)
             new_logs_count += 1
-            
+            print(f"   ✅ [GHI] {title}")
+
+        # PHẦN 2: GỬI TELEGRAM (Chỉ gửi ở nến cuối cùng của phiên chạy)
+        # Tách biệt hoàn toàn với việc Ghi Notion
+        if is_last_candle:
+            icon = "⚪"
+            if "MUA" in display_label: icon = "🟢"
+            elif "BÁN" in display_label: icon = "🔴"
+            elif "CẮT LỖ" in display_label: icon = "⚠️"
+            elif "CHỐT LỜI" in display_label: icon = "💰"
+            elif "GIỮ" in display_label: icon = "✊"
+            elif "KHÔNG MUA" in display_label: icon = "⛔"
+
             final_reason = advice
             if risk_reason: final_reason = risk_reason
             elif tech_reason: final_reason = tech_reason
@@ -325,9 +336,8 @@ def run_campaign(config):
             )
             send_telegram_message(msg)
 
-    # [UPDATE] THÔNG BÁO BUILD LOG NẾU KHÔNG CÓ LỆNH MỚI
     if new_logs_count == 0:
-        print(f"✅ [BUILD LOG] Dữ liệu đã đồng bộ - Không ghi lệnh mới cho {symbol}.")
+        print(f"✅ [BUILD LOG] Dữ liệu đã đồng bộ (Không ghi thêm vào Notion).")
 
     last_item = data_to_trade[-1]
     equity_final = cash + (stock * last_item['p'])
