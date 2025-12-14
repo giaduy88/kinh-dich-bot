@@ -5,6 +5,10 @@ import re
 import os
 from datetime import datetime, timezone, timedelta
 
+# --- CẤU HÌNH PHÍ GIAO DỊCH ---
+FEE_CRYPTO = 0.001   # 0.1% (Binance/KuCoin)
+FEE_STOCK = 0.0015   # 0.15% (Thuế + Phí CTCK)
+
 # --- THƯ VIỆN ---
 try:
     import ccxt
@@ -32,6 +36,7 @@ def get_historical_data(symbol, days):
                 try:
                     ohlcv = ex.fetch_ohlcv(sym_map, '1h', since=current_since, limit=1000)
                 except Exception as e:
+                    print(f"❌ [BUILD LOG] Lỗi kết nối sàn Crypto với mã {symbol}: {str(e)}")
                     return [], f"Lỗi sàn Crypto: {str(e)}", "ERROR"
 
                 if not ohlcv: break 
@@ -52,10 +57,13 @@ def get_historical_data(symbol, days):
                 current_since = last_candle + (60 * 60 * 1000)
                 time.sleep(0.1)
 
-            if not all_ohlcv: return [], "Không tìm thấy dữ liệu Crypto.", "ERROR"
+            if not all_ohlcv: 
+                print(f"❌ [BUILD LOG] Không tìm thấy dữ liệu Crypto cho mã {symbol}")
+                return [], "Không tìm thấy dữ liệu Crypto.", "ERROR"
             return all_ohlcv, "OK", "CRYPTO"
             
         except Exception as e:
+            print(f"❌ [BUILD LOG] Lỗi hệ thống Backtest Crypto: {str(e)}")
             return [], f"Lỗi hệ thống Crypto: {str(e)}", "ERROR"
 
     # 2. XỬ LÝ CHỨNG KHOÁN
@@ -74,9 +82,12 @@ def get_historical_data(symbol, days):
                         "t": datetime.fromtimestamp(res['t'][i], tz=timezone(timedelta(hours=7))),
                         "p": float(res['c'][i])
                     })
-            else: return [], "Không tìm thấy dữ liệu Stock.", "ERROR"
+            else: 
+                print(f"❌ [BUILD LOG] Không tìm thấy dữ liệu Stock cho mã {symbol} (Hoặc mã sai)")
+                return [], "Không tìm thấy dữ liệu Stock.", "ERROR"
             return data, "OK", "STOCK"
         except Exception as e:
+            print(f"❌ [BUILD LOG] Lỗi kết nối API Stock: {str(e)}")
             return [], f"Lỗi kết nối Stock: {str(e)}", "ERROR"
 
 # --- LOGIC ---
@@ -133,11 +144,17 @@ def run_backtest_core(symbol, days, advice_map):
         
         if len(data) < 20: return f"❌ <b>Dữ liệu quá ít</b>\nChỉ tìm thấy {len(data)} nến."
 
-        if asset_type == "CRYPTO": capital, currency, min_order = 5000, "$", 100
-        else: capital, currency, min_order = 100_000_000, "đ", 5_000_000
+        # Cấu hình Vốn & Phí
+        if asset_type == "CRYPTO": 
+            capital, currency, min_order = 5000, "$", 100
+            fee_rate = FEE_CRYPTO
+        else: 
+            capital, currency, min_order = 100_000_000, "đ", 5_000_000
+            fee_rate = FEE_STOCK
 
         cash, stock, avg_price = capital, 0, 0
         trade_count, win_count, loss_count = 0, 0, 0
+        total_fees = 0 # Tổng phí đã trả
         
         for item in data:
             dt, price = item['t'], item['p']
@@ -161,28 +178,43 @@ def run_backtest_core(symbol, days, advice_map):
             if risk_action == "STOP_LOSS": final_action, final_percent = "BÁN", 1.0
             elif risk_action == "TAKE_PROFIT": final_action, final_percent = "BÁN", 0.5
 
+            # [UPDATE] LOGIC TÍNH PHÍ MUA
             if final_action == "MUA":
                 amt = cash * final_percent
                 if amt > min_order:
                     qty = amt / price
                     if asset_type == "STOCK": qty = int(qty // 100) * 100
                     if qty > 0:
-                        current_val, new_val = stock * avg_price, qty * price
+                        buy_val = qty * price
+                        fee_val = buy_val * fee_rate # Phí mua
+                        total_fees += fee_val
+                        
+                        current_val = stock * avg_price
                         stock += qty
-                        avg_price = (current_val + new_val) / stock
-                        cash -= qty * price
+                        avg_price = (current_val + buy_val) / stock # Giá vốn không đổi, phí trừ thẳng vào tiền mặt
+                        cash -= (buy_val + fee_val) # Trừ tiền hàng + phí
 
+            # [UPDATE] LOGIC TÍNH PHÍ BÁN
             elif final_action == "BÁN":
                 qty = stock * final_percent
                 if asset_type == "STOCK": qty = int(qty // 100) * 100
                 if qty > stock: qty = stock
                 if qty > 0:
+                    sell_val = qty * price
+                    fee_val = sell_val * fee_rate # Phí bán
+                    total_fees += fee_val
+                    
                     stock -= qty
-                    cash += qty * price
-                    trade_pnl = (price - avg_price) * qty
-                    if trade_pnl > 0: win_count += 1
-                    elif trade_pnl < 0: loss_count += 1
+                    cash += (sell_val - fee_val) # Nhận tiền hàng - phí
+                    
+                    # Tính PnL thực (Đã trừ phí)
+                    # PnL = (Giá bán - Giá vốn) * Qty - Phí bán - (Phí mua phân bổ - cái này phức tạp, nên tính đơn giản trên cash flow)
+                    trade_pnl_gross = (price - avg_price) * qty
+                    # Đây là lãi gộp, lãi ròng sẽ phản ánh vào Cash cuối cùng
+                    if trade_pnl_gross > 0: win_count += 1
+                    elif trade_pnl_gross < 0: loss_count += 1
                     trade_count += 1
+                    
                     if stock == 0: avg_price = 0
 
         final_equity = cash + (stock * data[-1]['p'])
@@ -192,9 +224,8 @@ def run_backtest_core(symbol, days, advice_map):
         
         def fmt(v): return f"{v:,.2f}" if asset_type == "CRYPTO" else f"{v/1e6:,.1f} tr"
 
-        # [UPDATE] BÁO CÁO CHI TIẾT ĐẦY ĐỦ
         return (
-            f"📊 <b>KẾT QUẢ BACKTEST CHI TIẾT</b>\n"
+            f"📊 <b>KẾT QUẢ BACKTEST CHI TIẾT (Đã trừ phí)</b>\n"
             f"--------------------------\n"
             f"🔠 <b>Mã:</b> {symbol.upper()}\n"
             f"⏳ <b>Thời gian:</b> {days} ngày\n"
@@ -203,12 +234,14 @@ def run_backtest_core(symbol, days, advice_map):
             f"💰 <b>Vốn ban đầu:</b> {currency} {fmt(capital)}\n"
             f"💎 <b>Vốn kết thúc:</b> {currency} {fmt(final_equity)}\n"
             f"💵 <b>Lợi nhuận ròng:</b> {currency} {fmt(net_profit)}\n"
+            f"💸 <b>Tổng phí GD:</b> {currency} {fmt(total_fees)}\n"
             f"🚀 <b>ROI: {roi:+.2%}</b>\n"
             f"--------------------------\n"
             f"🛒 <b>Tổng số lệnh:</b> {trade_count}\n"
             f"✅ <b>Lệnh Thắng:</b> {win_count}\n"
             f"❌ <b>Lệnh Thua:</b> {loss_count}\n"
-            f"🎯 <b>Tỷ lệ Thắng (Winrate):</b> {win_rate:.1%}"
+            f"🎯 <b>Tỷ lệ Thắng:</b> {win_rate:.1%}"
         )
     except Exception as e:
+        print(f"❌ [BUILD LOG] Exception in Backtest: {str(e)}")
         return f"❌ <b>Lỗi Backtest</b>: {str(e)}"
