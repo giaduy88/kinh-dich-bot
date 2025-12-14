@@ -186,6 +186,7 @@ def run_campaign(config):
     is_crypto = "Binance" in market or "Crypto" in market
     data_raw = []
     
+    # Fetch Data
     if is_crypto:
         try:
             ex = ccxt.kucoin()
@@ -311,8 +312,7 @@ def run_campaign(config):
             new_logs_count += 1
             print(f"   ✅ [GHI] {title}")
 
-        # PHẦN 2: GỬI TELEGRAM (Chỉ gửi ở nến cuối cùng của phiên chạy)
-        # Tách biệt hoàn toàn với việc Ghi Notion
+        # PHẦN 2: GỬI TELEGRAM (Luôn gửi ở nến cuối cùng)
         if is_last_candle:
             icon = "⚪"
             if "MUA" in display_label: icon = "🟢"
@@ -326,12 +326,13 @@ def run_campaign(config):
             if risk_reason: final_reason = risk_reason
             elif tech_reason: final_reason = tech_reason
             
+            # [UPDATED] FORMAT TIN NHẮN MỚI
             msg = (
                 f"🔔 <b>TÍN HIỆU: {symbol}</b>\n"
                 f"{icon} <b>Lệnh:</b> {display_label}\n"
                 f"⏰ <b>Time:</b> {time_sig}\n"
                 f"💵 <b>Giá:</b> {price:,.2f}\n"
-                f"📊 <b>Chỉ số:</b> RSI {rsi:.0f} | SMA20 {sma20:,.0f}\n"
+                f"📊 <b>Chỉ số: RSI: </b> {rsi:.0f} | <b>SMA20: </b> {sma20:,.0f}\n"
                 f"💡 <b>Lý do:</b> {final_reason}"
             )
             send_telegram_message(msg)
