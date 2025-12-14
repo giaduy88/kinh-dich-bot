@@ -8,25 +8,27 @@ import sys
 import math
 from datetime import datetime, timezone, timedelta
 
-# Import Module Backtest
+# Import Module Backtest (Có xử lý lỗi nếu file không tồn tại)
 try:
     from backtest import run_backtest_core
 except ImportError:
     pass
 
-# --- 1. CẤU HÌNH ---
+# --- 1. CẤU HÌNH HỆ THỐNG ---
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN")
 CONFIG_DB_ID = os.environ.get("CONFIG_DB_ID")
 LOG_DB_ID    = os.environ.get("LOG_DB_ID")
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-STOP_LOSS_PCT = -0.07
-TAKE_PROFIT_PCT = 0.15
-USD_VND_RATE = 25300 # Tỷ giá ước tính để tính tổng NAV
+# Tham số quản trị rủi ro & NAV
+STOP_LOSS_PCT = -0.07   # Cắt lỗ 7%
+TAKE_PROFIT_PCT = 0.15  # Chốt lời 15%
+USD_VND_RATE = 25300    # Tỷ giá quy đổi
 
+# Kiểm tra biến môi trường
 if not NOTION_TOKEN or not CONFIG_DB_ID or not LOG_DB_ID:
-    print("❌ LỖI: Thiếu Notion Secrets.")
+    print("❌ LỖI: Thiếu Notion Secrets. Vui lòng kiểm tra Settings > Secrets.")
     sys.exit(1)
 
 def extract_id(text):
@@ -37,7 +39,7 @@ def extract_id(text):
 CONFIG_DB_ID = extract_id(CONFIG_DB_ID)
 LOG_DB_ID = extract_id(LOG_DB_ID)
 
-# --- 2. DỮ LIỆU DỰ PHÒNG ---
+# --- 2. DỮ LIỆU LỜI KHUYÊN DỰ PHÒNG ---
 BACKUP_CSV = """KEY_ID,Lời Khuyên
 G1-B1,Đại cát đại lợi, thời cơ chín muồi. Nên mua tất tay.
 G1-B43,Nguy hiểm rình rập, bán tháo ngay lập tức.
@@ -45,7 +47,7 @@ G1-B14,Vận khí tốt, có thể mua vào tích lũy.
 G23-B4,Mông lung xấu, nên hạ tỷ trọng bán bớt.
 """
 
-# --- 3. THƯ VIỆN ---
+# --- 3. THƯ VIỆN BỔ TRỢ ---
 try:
     import ccxt
     from lunardate import LunarDate
@@ -53,42 +55,48 @@ except ImportError: pass
 import ccxt
 from lunardate import LunarDate
 
+# --- 4. CÁC HÀM TIỆN ÍCH (UTILS) ---
 def send_telegram_message(message):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
         payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"}
         requests.post(url, json=payload, timeout=10)
-    except: pass
+    except Exception as e:
+        print(f"⚠️ Lỗi gửi Telegram: {e}")
 
-# --- 4. HÀM CHECK LỆNH BACKTEST ---
-def check_telegram_command(adv_map):
-    if not TELEGRAM_TOKEN: return
-    print("📩 Đang kiểm tra tin nhắn Telegram...")
+def notion_request(endpoint, method="POST", payload=None):
+    url = f"https://api.notion.com/v1/{endpoint}"
+    headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
     try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-        res = requests.get(url, timeout=10).json()
-        if not res.get('ok') or not res.get('result'): return
-        
-        last_msg = res['result'][-1]
-        message = last_msg.get('message', {})
-        text = message.get('text', '').strip()
-        msg_date = message.get('date', 0)
-        
-        if int(time.time()) - msg_date > 600: return
+        if method == "POST": response = requests.post(url, headers=headers, json=payload)
+        else: response = requests.get(url, headers=headers)
+        return response.json() if response.status_code == 200 else None
+    except: return None
 
-        if text.lower().startswith('bp '):
-            parts = text.split()
-            if len(parts) >= 2:
-                symbol = parts[1].upper()
-                days = int(parts[2]) if len(parts) > 2 else 90
-                print(f"   -> ⚙️ Backtest: {symbol} ({days} ngày)")
-                send_telegram_message(f"⏳ <b>Đang chạy Backtest cho {symbol}...</b>")
-                report = run_backtest_core(symbol, days, adv_map)
-                send_telegram_message(report)
-    except Exception as e: print(f"❌ Lỗi Telegram: {e}")
+def load_advice_data():
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    file_path = os.path.join(current_dir, 'data_loi_khuyen.csv')
+    if os.path.exists(file_path): return pd.read_csv(file_path)
+    return pd.read_csv(io.StringIO(BACKUP_CSV))
 
-# --- 5. LOGIC CORE ---
+def get_existing_signatures(symbol):
+    payload = {"filter": {"property": "Mã", "rich_text": {"contains": symbol}}, "sorts": [{"property": "Giờ Giao Dịch", "direction": "descending"}], "page_size": 100}
+    try: data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
+    except: 
+        payload["sorts"] = [{"property": "Thời Gian", "direction": "descending"}]
+        data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
+    s = set()
+    if data and 'results' in data:
+        for p in data['results']:
+            try:
+                t = p['properties']['Thời Gian']['title'][0]['plain_text']
+                match = re.search(r'(\d{2}:\d{2} \d{2}/\d{2})', t)
+                if match: s.add(match.group(1))
+            except: pass
+    return s
+
+# --- 5. HÀM XỬ LÝ DỮ LIỆU & LOGIC ---
 def get_stock_data(symbol):
     try:
         to_ts = int(time.time())
@@ -108,7 +116,9 @@ def get_stock_data(symbol):
 def add_technical_indicators(data):
     if not data: return []
     df = pd.DataFrame(data)
+    # SMA 20
     df['SMA20'] = df['p'].rolling(window=20).mean()
+    # RSI 14
     delta = df['p'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -116,21 +126,6 @@ def add_technical_indicators(data):
     df['RSI'] = 100 - (100 / (1 + rs))
     df = df.fillna(0)
     return df.to_dict('records')
-
-def notion_request(endpoint, method="POST", payload=None):
-    url = f"https://api.notion.com/v1/{endpoint}"
-    headers = {"Authorization": f"Bearer {NOTION_TOKEN}", "Content-Type": "application/json", "Notion-Version": "2022-06-28"}
-    try:
-        if method == "POST": response = requests.post(url, headers=headers, json=payload)
-        else: response = requests.get(url, headers=headers)
-        return response.json() if response.status_code == 200 else None
-    except: return None
-
-def load_advice_data():
-    current_dir = os.path.dirname(os.path.abspath(__file__))
-    file_path = os.path.join(current_dir, 'data_loi_khuyen.csv')
-    if os.path.exists(file_path): return pd.read_csv(file_path)
-    return pd.read_csv(io.StringIO(BACKUP_CSV))
 
 king_wen_matrix = [[1, 10, 13, 25, 44, 6, 33, 12], [43, 58, 49, 17, 28, 47, 31, 45], [14, 38, 30, 21, 50, 64, 56, 35], [34, 54, 55, 51, 32, 40, 62, 16], [9, 61, 37, 42, 57, 59, 53, 20], [5, 60, 63, 3, 48, 29, 39, 8], [26, 41, 22, 27, 18, 4, 52, 23], [11, 19, 36, 24, 46, 7, 15, 2]]
 
@@ -164,23 +159,37 @@ def analyze_smart_action(text):
     if any(w in text for w in normal_sell): return "BÁN", 0.5
     return "GIỮ", 0.0
 
-def get_existing_signatures(symbol):
-    payload = {"filter": {"property": "Mã", "rich_text": {"contains": symbol}}, "sorts": [{"property": "Giờ Giao Dịch", "direction": "descending"}], "page_size": 100}
-    try: data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
-    except: 
-        payload["sorts"] = [{"property": "Thời Gian", "direction": "descending"}]
-        data = notion_request(f"databases/{LOG_DB_ID}/query", "POST", payload)
-    s = set()
-    if data and 'results' in data:
-        for p in data['results']:
-            try:
-                t = p['properties']['Thời Gian']['title'][0]['plain_text']
-                match = re.search(r'(\d{2}:\d{2} \d{2}/\d{2})', t)
-                if match: s.add(match.group(1))
-            except: pass
-    return s
+# --- 6. HÀM CHECK LỆNH BACKTEST TỪ TELEGRAM ---
+def check_telegram_command(adv_map):
+    if not TELEGRAM_TOKEN: return
+    print("📩 Đang kiểm tra tin nhắn Telegram...")
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+        res = requests.get(url, timeout=10).json()
+        if not res.get('ok') or not res.get('result'): return
+        
+        last_msg = res['result'][-1]
+        msg_date = last_msg.get('message', {}).get('date', 0)
+        text = last_msg.get('message', {}).get('text', '').strip()
+        
+        # Chỉ nhận lệnh trong 10 phút gần nhất
+        if int(time.time()) - msg_date > 600: return
 
-# --- 6. RUN CAMPAIGN ---
+        if text.lower().startswith('bp '):
+            try:
+                parts = text.split()
+                if len(parts) >= 2:
+                    symbol = parts[1].upper()
+                    days = int(parts[2]) if len(parts) > 2 else 90
+                    print(f"   -> ⚙️ Backtest: {symbol} ({days} ngày)")
+                    send_telegram_message(f"⏳ <b>Đang chạy Backtest cho {symbol}...</b>")
+                    report = run_backtest_core(symbol, days, adv_map)
+                    send_telegram_message(report)
+            except Exception as e:
+                send_telegram_message(f"❌ Lỗi lệnh Backtest: {str(e)}")
+    except Exception as e: print(f"❌ Lỗi Telegram API: {e}")
+
+# --- 7. HÀM CHẠY CHIẾN DỊCH (CORE ENGINE) ---
 def run_campaign(config):
     try:
         name = config['properties']['Tên Chiến Dịch']['title'][0]['plain_text']
@@ -194,6 +203,7 @@ def run_campaign(config):
     is_crypto = "Binance" in market or "Crypto" in market
     data_raw = []
     
+    # Fetch Data
     if is_crypto:
         try:
             ex = ccxt.kucoin()
@@ -207,6 +217,7 @@ def run_campaign(config):
         print("   -> ❌ Không có dữ liệu giá.")
         return None
 
+    # Calculate Indicators
     data_full = add_technical_indicators(data_raw)
     data_to_trade = data_full[-48:] 
     df_adv = load_advice_data()
@@ -215,33 +226,47 @@ def run_campaign(config):
     
     cash, stock, avg_price = capital, 0, 0
     
-    # --- SIMULATION ---
+    # --- SIMULATION LOOP ---
     for item in data_to_trade:
         dt, price = item['t'], item['p']
         sma20, rsi = item.get('SMA20', 0), item.get('RSI', 50)
         time_sig = dt.strftime('%H:%M %d/%m')
         holding_pnl = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
+        # Logic Kinh Dịch & NLP
         key = calculate_hexagram(dt)
         advice = adv_map.get(key, "")
+        if not advice: advice = f"Quẻ {key} (Chưa có lời khuyên)"
+        
         action, percent = analyze_smart_action(advice)
         
+        # Logic Risk Management
         risk_action = None
+        risk_reason = ""
+        tech_reason = ""
+        
         if stock > 0:
-            if holding_pnl <= STOP_LOSS_PCT: risk_action = "STOP_LOSS"
-            elif holding_pnl >= TAKE_PROFIT_PCT: risk_action = "TAKE_PROFIT"
+            if holding_pnl <= STOP_LOSS_PCT: 
+                risk_action, risk_reason = "STOP_LOSS", f"⚠️ CẮT LỖ (Lỗ {holding_pnl:.1%})"
+            elif holding_pnl >= TAKE_PROFIT_PCT: 
+                risk_action, risk_reason = "TAKE_PROFIT", f"💰 CHỐT LỜI (Lãi {holding_pnl:.1%})"
 
+        # Logic Technical Filter
         tech_status = "OK"
         if action == "MUA":
-            if price < sma20 and rsi > 35: action, tech_status = "GIỮ", "BAD_TECH"
-            if rsi > 75: action, tech_status = "GIỮ", "OVERBOUGHT"
+            if price < sma20 and rsi > 35: 
+                action, tech_status, tech_reason = "GIỮ", "BAD_TECH", f"(⛔ Giá < SMA20 & RSI={rsi:.0f})"
+            if rsi > 75: 
+                action, tech_status, tech_reason = "GIỮ", "OVERBOUGHT", f"(⛔ RSI={rsi:.0f} Quá mua)"
 
+        # Final Decision
         final_action, final_percent = action, percent
         if risk_action == "STOP_LOSS": final_action, final_percent = "BÁN", 1.0
         elif risk_action == "TAKE_PROFIT": final_action, final_percent = "BÁN", 0.5
         
         display_label, qty, note = "GIỮ", 0, ""
 
+        # Execution Simulation
         if final_action == "MUA":
             amt = cash * final_percent
             if amt > 1:
@@ -263,23 +288,29 @@ def run_campaign(config):
                 stock -= qty_sell
                 cash += qty_sell * price
                 display_label = risk_action if risk_action else "BÁN"
+                if risk_action == "STOP_LOSS": display_label = "✂️ CẮT LỖ"
+                elif risk_action == "TAKE_PROFIT": display_label = "💵 CHỐT LỜI"
                 if stock == 0: avg_price = 0
-            if display_label not in ["BÁN", "STOP_LOSS", "TAKE_PROFIT"] and stock == 0: display_label = "⛔ KHÔNG MUA"
+            if display_label not in ["BÁN", "✂️ CẮT LỖ", "💵 CHỐT LỜI"] and stock == 0: display_label = "⛔ KHÔNG MUA"
         else:
             display_label = "✊ GIỮ" if stock > 0 else "⛔ KHÔNG MUA"
 
-        # Logging (Giữ nguyên logic cũ)
+        # Tính toán NAV & PnL
         current_asset_val = stock * price
         equity = cash + current_asset_val
         roi_total = (equity - capital) / capital
         allocation = current_asset_val / equity if equity > 0 else 0
         holding_pnl_new = (price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
+        # GHI LOG & GỬI ALERT
         if time_sig not in existing:
             icon = "⚪"
             if "MUA" in display_label: icon = "🟢"
-            if "BÁN" in display_label: icon = "🔴"
-            if "GIỮ" in display_label: icon = "✊"
+            elif "BÁN" in display_label: icon = "🔴"
+            elif "CẮT LỖ" in display_label: icon = "⚠️"
+            elif "CHỐT LỜI" in display_label: icon = "💰"
+            elif "GIỮ" in display_label: icon = "✊"
+            elif "KHÔNG MUA" in display_label: icon = "⛔"
             
             title = f"{icon} {display_label} | {time_sig}"
             payload = {
@@ -301,34 +332,37 @@ def run_campaign(config):
             notion_request("pages", "POST", payload)
             existing.add(time_sig)
             
-            if any(x in display_label for x in ["MUA", "BÁN", "STOP", "TAKE"]):
-                msg = f"🔔 <b>{symbol}: {display_label}</b>\nGiá: {price}\nROI: {holding_pnl_new:.1%}"
-                send_telegram_message(msg)
+            # --- [IMPORTANT] GỬI ALERT FULL CHO MỌI LỆNH ---
+            final_reason = advice
+            if risk_reason: final_reason = risk_reason
+            elif tech_reason: final_reason = tech_reason
+            
+            # ĐÂY LÀ DÒNG BẠN CẦN: Đã thêm SMA20 vào cạnh RSI
+            msg = (
+                f"🔔 <b>TÍN HIỆU: {symbol}</b>\n"
+                f"{icon} <b>Lệnh:</b> {display_label}\n"
+                f"⏰ <b>Time:</b> {time_sig}\n"
+                f"💵 <b>Giá:</b> {price:,.2f}\n"
+                f"📊 <b>Chỉ số:</b> RSI {rsi:.0f} | SMA20 {sma20:,.0f}\n"
+                f"💡 <b>Lý do:</b> {final_reason}"
+            )
+            send_telegram_message(msg)
 
-    # TRẢ VỀ KẾT QUẢ CHO REPORT
+    # TRẢ VỀ KẾT QUẢ CHO BÁO CÁO 6H SÁNG
     last_item = data_to_trade[-1]
     last_price = last_item['p']
     equity_final = cash + (stock * last_price)
     
-    # Tính PnL theo tiền (Amount)
     pnl_value = (last_price - avg_price) * stock if stock > 0 else 0
     pnl_percent = (last_price - avg_price) / avg_price if (stock > 0 and avg_price > 0) else 0
 
     return {
-        "symbol": symbol,
-        "price": last_price,
-        "equity": equity_final,
-        "cash": cash, # Tiền mặt còn lại
-        "stock_amt": stock, # Số lượng hàng đang giữ
-        "roi": (equity_final - capital) / capital,
-        "pnl_percent": pnl_percent,
-        "pnl_value": pnl_value,
-        "hold": stock > 0,
-        "rsi": last_item.get('RSI', 50), # Chỉ số RSI hiện tại
-        "type": "CRYPTO" if is_crypto else "STOCK"
+        "symbol": symbol, "price": last_price, "equity": equity_final, "cash": cash, "stock_amt": stock,
+        "roi": (equity_final - capital) / capital, "pnl_percent": pnl_percent, "pnl_value": pnl_value,
+        "hold": stock > 0, "rsi": last_item.get('RSI', 50), "type": "CRYPTO" if is_crypto else "STOCK"
     }
 
-# --- MAIN ---
+# --- 8. MAIN ENTRY POINT ---
 print("📡 Đang khởi động...")
 df_adv = load_advice_data()
 adv_map = dict(zip(df_adv['KEY_ID'], df_adv['Lời Khuyên']))
@@ -336,7 +370,7 @@ adv_map = dict(zip(df_adv['KEY_ID'], df_adv['Lời Khuyên']))
 # 1. Check lệnh Telegram
 check_telegram_command(adv_map)
 
-# 2. Chạy Campaign
+# 2. Run Campaign
 query = {"filter": {"property": "Trạng Thái", "status": {"equals": "Đang chạy"}}}
 res = notion_request(f"databases/{CONFIG_DB_ID}/query", "POST", query)
 
@@ -347,72 +381,34 @@ if res and 'results' in res:
         stat = run_campaign(cfg)
         if stat: daily_stats.append(stat)
 
-# 3. [NEW] GỬI BÁO CÁO NÂNG CAO 6H SÁNG (GIỜ VN)
+# 3. Morning Report
 now_utc = datetime.now(timezone.utc)
 now_vn = now_utc + timedelta(hours=7)
 
 if now_vn.hour == 6 and daily_stats:
-    
-    # A. TÍNH TOÁN TỔNG HỢP
-    total_nav_vnd = 0
-    total_cash_vnd = 0
-    total_cash_usd = 0
-    
-    list_stock = []
-    list_crypto = []
+    total_nav_vnd, total_cash_vnd, total_cash_usd = 0, 0, 0
+    list_stock, list_crypto = [], []
 
     for s in daily_stats:
         if s['type'] == "STOCK":
-            total_nav_vnd += s['equity']
-            total_cash_vnd += s['cash']
-            list_stock.append(s)
+            total_nav_vnd += s['equity']; total_cash_vnd += s['cash']; list_stock.append(s)
         else:
-            total_nav_vnd += s['equity'] * USD_VND_RATE # Quy đổi Crypto ra VND
-            total_cash_usd += s['cash']
-            list_crypto.append(s)
+            total_nav_vnd += s['equity'] * USD_VND_RATE; total_cash_usd += s['cash']; list_crypto.append(s)
 
-    # B. LẤY QUẺ TRONG NGÀY (Lời khuyên chung)
     daily_key = calculate_hexagram(now_vn)
-    daily_advice = adv_map.get(daily_key, "Vận khí bình ổn, tùy cơ ứng biến.")
+    daily_advice = adv_map.get(daily_key, "Vận khí bình ổn.")
 
-    # C. SOẠN TIN NHẮN (ADVANCED TEMPLATE)
-    msg = f"☕ <b>MORNING BRIEFING</b> - {now_vn.strftime('%d/%m/%Y')}\n"
-    msg += "--------------------------\n"
-    msg += f"💰 <b>TỔNG NAV: {total_nav_vnd/1e6:,.1f} tr</b>\n"
-    msg += f"💵 <b>Tiền mặt khả dụng:</b>\n"
-    msg += f"   • VNĐ: {total_cash_vnd:,.0f} đ\n"
-    msg += f"   • USD: {total_cash_usd:,.2f} $\n"
-    msg += "--------------------------\n\n"
-    
-    # Danh mục Chứng khoán
+    msg = f"☕ <b>MORNING BRIEFING</b> - {now_vn.strftime('%d/%m/%Y')}\n--------------------------\n💰 <b>TỔNG NAV: {total_nav_vnd/1e6:,.1f} tr</b>\n💵 <b>Tiền mặt khả dụng:</b>\n   • VNĐ: {total_cash_vnd:,.0f} đ\n   • USD: {total_cash_usd:,.2f} $\n--------------------------\n\n"
     if list_stock:
         msg += "🇻🇳 <b>CHỨNG KHOÁN:</b>\n"
         for i, s in enumerate(list_stock, 1):
-            icon_pnl = "🟢" if s['pnl_percent'] >= 0 else "🔴"
             status = f"✊ Giữ {s['stock_amt']:,.0f} cp" if s['hold'] else "⚪ Full Cash"
-            rsi_stt = "(Nóng)" if s['rsi']>70 else "(Lạnh)" if s['rsi']<30 else ""
-            
-            msg += f"{i}. <b>{s['symbol']}</b>: {icon_pnl} {s['pnl_percent']:+.2%}\n"
-            msg += f"   • Vị thế: {status}\n"
-            msg += f"   • RSI: {s['rsi']:.0f} {rsi_stt}\n\n"
-
-    # Danh mục Crypto
+            msg += f"{i}. <b>{s['symbol']}</b>: {'🟢' if s['pnl_percent']>=0 else '🔴'} {s['pnl_percent']:+.2%}\n   • Vị thế: {status}\n\n"
     if list_crypto:
         msg += "🌍 <b>CRYPTO:</b>\n"
         for i, s in enumerate(list_crypto, 1):
-            icon_pnl = "🟢" if s['pnl_percent'] >= 0 else "🔴"
             status = f"✊ Giữ {s['stock_amt']:.4f}" if s['hold'] else "⚪ Full Cash"
-            rsi_stt = "(Nóng)" if s['rsi']>70 else "(Lạnh)" if s['rsi']<30 else ""
-            
-            msg += f"{i}. <b>{s['symbol']}</b>: {icon_pnl} {s['pnl_percent']:+.2%}\n"
-            msg += f"   • Vị thế: {status}\n"
-            msg += f"   • RSI: {s['rsi']:.0f} {rsi_stt}\n\n"
+            msg += f"{i}. <b>{s['symbol']}</b>: {'🟢' if s['pnl_percent']>=0 else '🔴'} {s['pnl_percent']:+.2%}\n   • Vị thế: {status}\n\n"
 
-    msg += "--------------------------\n"
-    msg += f"🔮 <b>QUẺ TRONG NGÀY ({daily_key}):</b>\n"
-    msg += f"<i>{daily_advice}</i>\n"
-    
+    msg += f"🔮 <b>QUẺ NGÀY ({daily_key}):</b>\n<i>{daily_advice}</i>"
     send_telegram_message(msg)
-    print("✅ Đã gửi báo cáo nâng cao đầu ngày.")
-else:
-    print(f"⌚ Bây giờ là {now_vn.strftime('%H:%M')} (VN). Chưa đến giờ báo cáo (06:00).")
